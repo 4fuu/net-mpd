@@ -1,0 +1,4 @@
+.refs/
+net-mpd.exe
+*.test
+coverage.out

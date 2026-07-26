@@ -127,29 +127,106 @@ func count(ss []ncm.Song, tag string) int {
 	return len(m)
 }
 
-func (c *client) idle(a []string) []byte {
+func (c *client) idle(a []string) ([]byte, bool) {
 	want := map[string]bool{}
 	for _, x := range a[1:] {
 		want[strings.ToLower(x)] = true
 	}
-	ch, cancel := c.s.State.Subscribe()
-	defer cancel()
+	flush := func() []byte {
+		var b strings.Builder
+		for _, kind := range c.s.State.takePending(c.events, want) {
+			fmt.Fprintf(&b, "changed: %s\n", kind)
+		}
+		if b.Len() == 0 {
+			return nil
+		}
+		return []byte(b.String())
+	}
 	for {
+		if data := flush(); data != nil {
+			return data, false
+		}
 		select {
-		case kind := <-ch:
-			if len(want) == 0 || want[kind] {
-				return []byte("changed: " + kind + "\n")
+		case <-c.events.wake:
+		case req, ok := <-c.lines:
+			if !ok {
+				return nil, true
 			}
-		case req := <-c.lines:
 			if req.err != nil {
-				return nil
+				return nil, true
 			}
 			x, e := Lex(req.line)
 			if e == nil && len(x) > 0 && strings.EqualFold(x[0], "noidle") {
-				return nil
+				return nil, false
 			}
 		}
 	}
+}
+
+func queuePosition(value string, st Status) (int, error) {
+	var pos int
+	if strings.HasPrefix(value, "+") {
+		n, err := strconv.Atoi(value[1:])
+		if err != nil {
+			return 0, err
+		}
+		if st.Current < 0 {
+			return 0, fmt.Errorf("no current song")
+		}
+		pos = st.Current + 1 + n
+	} else if strings.HasPrefix(value, "-") {
+		n, err := strconv.Atoi(value[1:])
+		if err != nil {
+			return 0, err
+		}
+		if st.Current < 0 {
+			return 0, fmt.Errorf("no current song")
+		}
+		pos = st.Current - n
+	} else {
+		var err error
+		pos, err = strconv.Atoi(value)
+		if err != nil {
+			return 0, fmt.Errorf("invalid position")
+		}
+	}
+	if pos < 0 || pos > len(st.Queue) {
+		return 0, fmt.Errorf("invalid position")
+	}
+	return pos, nil
+}
+
+func movePosition(value string, st Status, start, end int) (int, error) {
+	postLength := len(st.Queue) - (end - start)
+	if start < 0 || end <= start || end > len(st.Queue) {
+		return 0, fmt.Errorf("invalid range")
+	}
+	if !strings.HasPrefix(value, "+") && !strings.HasPrefix(value, "-") {
+		pos, err := strconv.Atoi(value)
+		if err != nil || pos < 0 || pos > postLength {
+			return 0, fmt.Errorf("invalid position")
+		}
+		return pos, nil
+	}
+	if st.Current < 0 || (st.Current >= start && st.Current < end) {
+		return 0, fmt.Errorf("relative move requires current song outside source range")
+	}
+	current := st.Current
+	if current >= end {
+		current -= end - start
+	}
+	n, err := strconv.Atoi(value[1:])
+	if err != nil {
+		return 0, fmt.Errorf("invalid position")
+	}
+	pos := current - n
+	if strings.HasPrefix(value, "+") {
+		pos = current + 1 + n
+	}
+	if pos < 0 || pos > postLength {
+		return 0, fmt.Errorf("invalid position")
+	}
+	return pos, nil
 }
 
 type condition struct{ tag, op, value string }

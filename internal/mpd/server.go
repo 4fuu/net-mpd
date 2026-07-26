@@ -37,16 +37,20 @@ type client struct {
 	s      *Server
 	c      net.Conn
 	lines  chan request
+	events *eventSubscription
 	limit  int
 	list   []string
 	listOK bool
 }
 
 func (s *Server) handle(conn net.Conn) {
-	cl := &client{s: s, c: conn, lines: make(chan request, 8), limit: 8192}
+	events, cancel := s.State.Subscribe()
+	cl := &client{s: s, c: conn, lines: make(chan request, 8), events: events, limit: 8192}
+	defer cancel()
 	defer conn.Close()
 	_, _ = io.WriteString(conn, "OK MPD 0.23.5\n")
 	go func() {
+		defer close(cl.lines)
 		r := bufio.NewReader(conn)
 		for {
 			line, e := r.ReadString('\n')
@@ -124,7 +128,7 @@ func (c *client) process(line string) bool {
 	return !close
 }
 
-var supported = []string{"commands", "ping", "close", "binarylimit", "status", "stats", "currentsong", "playlistinfo", "playlistid", "idle", "noidle", "lsinfo", "listplaylists", "listplaylistinfo", "list", "find", "search", "add", "load", "clear", "delete", "deleteid", "move", "moveid", "swap", "swapid", "shuffle", "play", "playid", "pause", "stop", "next", "previous", "seekcur", "setvol", "getvol", "repeat", "random", "single", "consume", "command_list_begin", "command_list_ok_begin", "command_list_end", "albumart", "readpicture", "findadd", "searchadd"}
+var supported = []string{"commands", "ping", "close", "binarylimit", "status", "stats", "currentsong", "playlistinfo", "playlistid", "idle", "noidle", "lsinfo", "listplaylists", "listplaylistinfo", "list", "find", "search", "add", "load", "clear", "delete", "deleteid", "move", "moveid", "swap", "swapid", "shuffle", "play", "playid", "pause", "stop", "next", "previous", "seekcur", "setvol", "getvol", "volume", "repeat", "random", "single", "consume", "command_list_begin", "command_list_ok_begin", "command_list_end", "albumart", "readpicture", "findadd", "searchadd"}
 
 func arg(a []string, n int) (string, error) {
 	if len(a) <= n {
@@ -215,7 +219,8 @@ func (c *client) exec(a []string) ([]byte, bool, int, error) {
 			}
 		}
 	case "idle":
-		return c.idle(a), false, 0, nil
+		data, closed := c.idle(a)
+		return data, closed, 0, nil
 	case "noidle":
 	case "listplaylists":
 		for _, p := range c.s.Catalog.Playlists() {
@@ -224,7 +229,7 @@ func (c *client) exec(a []string) ([]byte, bool, int, error) {
 	case "lsinfo":
 		if len(a) == 1 || a[1] == "" {
 			for _, p := range c.s.Catalog.Playlists() {
-				fmt.Fprintf(&b, "directory: %s\n", p.Name)
+				fmt.Fprintf(&b, "playlist: %s\nLast-Modified: 1970-01-01T00:00:00Z\n", p.Name)
 			}
 		} else {
 			ss, e := c.s.Catalog.PlaylistSongs(a[1])
@@ -256,9 +261,21 @@ func (c *client) exec(a []string) ([]byte, bool, int, error) {
 		if e != nil {
 			return nil, false, 50, e
 		}
-		for _, s := range ss {
-			c.s.State.Add(s)
+		start, end := 0, len(ss)
+		if len(a) > 2 {
+			start, end = parseRange([]string{"", a[2]}, len(ss))
+			if start < 0 || end < start || end > len(ss) {
+				return nil, false, 2, fmt.Errorf("invalid range")
+			}
 		}
+		pos := -1
+		if len(a) > 3 {
+			pos, e = queuePosition(a[3], st)
+			if e != nil {
+				return nil, false, 2, e
+			}
+		}
+		c.s.State.InsertBlock(ss[start:end], pos)
 	case "add":
 		u, e := arg(a, 1)
 		if e != nil {
@@ -270,7 +287,7 @@ func (c *client) exec(a []string) ([]byte, bool, int, error) {
 		}
 		pos := -1
 		if len(a) > 2 {
-			pos, e = strconv.Atoi(a[2])
+			pos, e = queuePosition(a[2], st)
 			if e != nil {
 				return nil, false, 2, fmt.Errorf("invalid position")
 			}
@@ -299,7 +316,41 @@ func (c *client) exec(a []string) ([]byte, bool, int, error) {
 		if e != nil {
 			return nil, false, 50, e
 		}
-	case "move", "moveid", "swap", "swapid":
+	case "move", "moveid":
+		source, e := arg(a, 1)
+		if e != nil {
+			return nil, false, 2, e
+		}
+		dest, e := arg(a, 2)
+		if e != nil {
+			return nil, false, 2, e
+		}
+		if cmd == "moveid" {
+			id, parseErr := strconv.ParseInt(source, 10, 64)
+			if parseErr != nil {
+				return nil, false, 2, fmt.Errorf("invalid song id")
+			}
+			from := findID(st.Queue, id)
+			to, positionErr := movePosition(dest, st, from, from+1)
+			if positionErr != nil {
+				return nil, false, 2, positionErr
+			}
+			e = c.s.State.Move(from, to)
+		} else {
+			start, end, rangeErr := commandRange(source, len(st.Queue))
+			if rangeErr != nil {
+				return nil, false, 2, rangeErr
+			}
+			to, positionErr := movePosition(dest, st, start, end)
+			if positionErr != nil {
+				return nil, false, 2, positionErr
+			}
+			e = c.s.State.MoveRange(start, end, to)
+		}
+		if e != nil {
+			return nil, false, 50, e
+		}
+	case "swap", "swapid":
 		x, e := atoi(a, 1)
 		if e != nil {
 			return nil, false, 2, e
@@ -311,19 +362,16 @@ func (c *client) exec(a []string) ([]byte, bool, int, error) {
 		if cmd == "swapid" {
 			x = findID(st.Queue, int64(x))
 			y = findID(st.Queue, int64(y))
-		} else if cmd == "moveid" {
-			x = findID(st.Queue, int64(x))
 		}
-		if strings.HasPrefix(cmd, "move") {
-			e = c.s.State.Move(x, y)
-		} else {
-			e = c.s.State.Swap(x, y)
-		}
+		e = c.s.State.Swap(x, y)
 		if e != nil {
 			return nil, false, 50, e
 		}
 	case "shuffle":
-		c.s.State.Shuffle()
+		start, end := parseRange(a, len(st.Queue))
+		if e := c.s.State.ShuffleRange(start, end); e != nil {
+			return nil, false, 50, e
+		}
 	case "play", "playid":
 		p := -1
 		if len(a) > 1 {
@@ -380,7 +428,17 @@ func (c *client) exec(a []string) ([]byte, bool, int, error) {
 		if e != nil {
 			return nil, false, 2, e
 		}
-		c.s.State.SetVolume(v)
+		if e = c.s.State.SetVolume(v); e != nil {
+			return nil, false, 50, e
+		}
+	case "volume":
+		v, e := atoi(a, 1)
+		if e != nil {
+			return nil, false, 2, e
+		}
+		if e = c.s.State.SetVolume(st.Volume + v); e != nil {
+			return nil, false, 50, e
+		}
 	case "getvol":
 		fmt.Fprintf(&b, "volume: %d\n", st.Volume)
 	case "repeat", "random", "single", "consume":

@@ -17,9 +17,11 @@ type Player interface {
 
 // FFPlay runs one ffplay child process at a time.
 type FFPlay struct {
+	opMu       sync.Mutex
 	mu         sync.Mutex
 	command    string
 	cmd        *exec.Cmd
+	done       chan struct{}
 	generation uint64
 	closed     bool
 }
@@ -32,12 +34,14 @@ func NewFFPlay(command string) *FFPlay {
 }
 
 func (p *FFPlay) Play(url string, offset time.Duration, volume int, onEnd func()) error {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	p.stopAndWait()
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.closed {
+		p.mu.Unlock()
 		return fmt.Errorf("player is closed")
 	}
-	p.stopLocked()
 	p.generation++
 	gen := p.generation
 	args := []string{"-nodisp", "-autoexit", "-loglevel", "quiet", "-volume", strconv.Itoa(volume)}
@@ -47,38 +51,60 @@ func (p *FFPlay) Play(url string, offset time.Duration, volume int, onEnd func()
 	args = append(args, url)
 	cmd := exec.Command(p.command, args...)
 	if err := cmd.Start(); err != nil {
+		p.mu.Unlock()
 		return fmt.Errorf("start ffplay: %w", err)
 	}
+	done := make(chan struct{})
 	p.cmd = cmd
+	p.done = done
+	p.mu.Unlock()
 	go func() {
 		err := cmd.Wait()
+		close(done)
 		p.mu.Lock()
 		valid := !p.closed && p.generation == gen && p.cmd == cmd
 		if valid {
 			p.cmd = nil
 		}
 		p.mu.Unlock()
-		if valid && err == nil && onEnd != nil {
+		if valid && onEnd != nil {
 			onEnd()
 		}
+		_ = err
 	}()
 	return nil
 }
 
-func (p *FFPlay) stopLocked() {
-	p.generation++
-	if p.cmd != nil && p.cmd.Process != nil {
-		_ = p.cmd.Process.Kill()
+func (p *FFPlay) stopAndWait() {
+	p.mu.Lock()
+	cmd, done := p.cmd, p.done
+	if cmd == nil {
+		p.mu.Unlock()
+		return
 	}
+	p.generation++
 	p.cmd = nil
+	p.done = nil
+	p.mu.Unlock()
+	if cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	<-done
 }
 
-func (p *FFPlay) Stop() error { p.mu.Lock(); defer p.mu.Unlock(); p.stopLocked(); return nil }
+func (p *FFPlay) Stop() error {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	p.stopAndWait()
+	return nil
+}
 func (p *FFPlay) Close() error {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	p.stopAndWait()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.closed {
-		p.stopLocked()
 		p.closed = true
 	}
 	return nil

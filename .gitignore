@@ -1,4 +1,4 @@
 .refs/
-net-mpd.exe
+net-mpd.exe*
 *.test
 coverage.out

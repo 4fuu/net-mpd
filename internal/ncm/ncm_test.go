@@ -63,4 +63,18 @@ func TestMusicfoxSession(t *testing.T) {
 	if len(playlists) == 0 {
 		t.Fatal("logged-in account has no playlists")
 	}
+	songs, err := c.PlaylistTracks(playlists[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(songs) == 0 {
+		t.Fatal("first playlist has no tracks")
+	}
+	playable, err := c.ResolveURL(songs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if playable.URL == "" {
+		t.Fatal("resolved an empty playback URL")
+	}
 }

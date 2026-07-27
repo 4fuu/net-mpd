@@ -23,6 +23,8 @@ type fakeMusic struct {
 	tracks     map[int64][]ncm.Song
 	nextID     int64
 	mutations  []string
+	resolveHit chan struct{}
+	resolveGo  chan struct{}
 }
 
 func (f *fakeMusic) Account() (ncm.User, error) { return ncm.User{ID: 1, Nickname: "测试"}, nil }
@@ -38,8 +40,19 @@ func (f *fakeMusic) PlaylistTracks(id int64) ([]ncm.Song, error) {
 }
 func (f *fakeMusic) SearchSongs(string, int) ([]ncm.Song, error) { return []ncm.Song{f.song}, nil }
 func (f *fakeMusic) ResolveURL(int64) (ncm.PlayableInfo, error) {
-	if f.resolveErr != nil {
-		return ncm.PlayableInfo{}, f.resolveErr
+	f.mu.Lock()
+	err, hit, proceed := f.resolveErr, f.resolveHit, f.resolveGo
+	if hit != nil {
+		f.resolveHit = nil
+		f.resolveGo = nil
+	}
+	f.mu.Unlock()
+	if hit != nil {
+		close(hit)
+		<-proceed
+	}
+	if err != nil {
+		return ncm.PlayableInfo{}, err
 	}
 	return ncm.PlayableInfo{URL: "fake://audio"}, nil
 }
@@ -107,14 +120,56 @@ func (f *fakeMusic) DeletePlaylistTracks(id int64, ids []int64) error {
 	return nil
 }
 
-type fakePlayer struct{ end func() }
+type fakePlayer struct {
+	end      func(error)
+	position time.Duration
+}
 
-func (f *fakePlayer) Play(_ string, _ time.Duration, _ int, end func()) error {
+func (f *fakePlayer) Play(_, _ string, offset time.Duration, _ int, end func(error)) error {
 	f.end = end
+	f.position = offset
 	return nil
 }
-func (f *fakePlayer) Stop() error  { return nil }
-func (f *fakePlayer) Close() error { return nil }
+func (f *fakePlayer) Pause() error                { return nil }
+func (f *fakePlayer) Resume() error               { return nil }
+func (f *fakePlayer) Seek(at time.Duration) error { f.position = at; return nil }
+func (f *fakePlayer) SetVolume(int) error         { return nil }
+func (f *fakePlayer) Position() time.Duration     { return f.position }
+func (f *fakePlayer) Stop() error                 { f.end = nil; return nil }
+func (f *fakePlayer) Close() error                { return nil }
+
+type blockingPlayer struct {
+	started chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	active  bool
+}
+
+func (p *blockingPlayer) Play(_, _ string, _ time.Duration, _ int, _ func(error)) error {
+	close(p.started)
+	<-p.release
+	p.mu.Lock()
+	p.active = true
+	p.mu.Unlock()
+	return nil
+}
+func (p *blockingPlayer) Pause() error             { return nil }
+func (p *blockingPlayer) Resume() error            { return nil }
+func (p *blockingPlayer) Seek(time.Duration) error { return nil }
+func (p *blockingPlayer) SetVolume(int) error      { return nil }
+func (p *blockingPlayer) Position() time.Duration  { return 0 }
+func (p *blockingPlayer) Stop() error {
+	p.mu.Lock()
+	p.active = false
+	p.mu.Unlock()
+	return nil
+}
+func (p *blockingPlayer) Close() error { return nil }
+func (p *blockingPlayer) isActive() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.active
+}
 
 func fixture(t *testing.T) (*Server, *fakeMusic) {
 	t.Helper()
@@ -320,7 +375,7 @@ func TestFailedPlayDoesNotInvalidateActivePlayer(t *testing.T) {
 	if err := s.State.Play(0); err == nil {
 		t.Fatal("expected unavailable song error")
 	}
-	activeEnd()
+	activeEnd(nil)
 	if got := s.State.Snapshot().State; got != "stop" {
 		t.Fatalf("active player callback was invalidated; state = %s", got)
 	}
@@ -467,5 +522,62 @@ func TestStoredPlaylistMutations(t *testing.T) {
 	}
 	if got := response(t, c, r, `listplaylist renamed`); !strings.HasPrefix(got, "ACK ") {
 		t.Fatalf("rm not visible: %q", got)
+	}
+}
+
+func TestStopWinsAgainstInFlightBackendStart(t *testing.T) {
+	s, music := fixture(t)
+	backend := &blockingPlayer{started: make(chan struct{}), release: make(chan struct{})}
+	s.State.player = backend
+	s.State.Add(music.song)
+	playDone := make(chan error, 1)
+	go func() { playDone <- s.State.Play(0) }()
+	<-backend.started
+	stopDone := make(chan struct{})
+	go func() {
+		s.State.Stop()
+		close(stopDone)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for s.State.Snapshot().State != "stop" && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	close(backend.release)
+	if err := <-playDone; err != nil {
+		t.Fatal(err)
+	}
+	<-stopDone
+	if backend.isActive() {
+		t.Fatal("backend remained active after Stop completed")
+	}
+	if got := s.State.Snapshot().State; got != "stop" {
+		t.Fatalf("state = %q, want stop", got)
+	}
+}
+
+func TestStopInvalidatesReservedNaturalAdvance(t *testing.T) {
+	s, music := fixture(t)
+	backend := s.State.player.(*fakePlayer)
+	s.State.Add(music.song)
+	s.State.Add(ncm.Song{ID: 8, Title: "next", Duration: time.Minute})
+	if err := s.State.Play(0); err != nil {
+		t.Fatal(err)
+	}
+	activeEnd := backend.end
+	hit, proceed := make(chan struct{}), make(chan struct{})
+	music.mu.Lock()
+	music.resolveHit, music.resolveGo = hit, proceed
+	music.mu.Unlock()
+	advanceDone := make(chan struct{})
+	go func() {
+		activeEnd(nil)
+		close(advanceDone)
+	}()
+	<-hit
+	s.State.Stop()
+	close(proceed)
+	<-advanceDone
+	if backend.end != nil {
+		t.Fatal("natural end started a successor after Stop completed")
 	}
 }

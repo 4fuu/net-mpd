@@ -22,6 +22,7 @@ type Status struct {
 	State                           string
 	Current                         int
 	Elapsed                         time.Duration
+	Error                           string
 }
 type eventSubscription struct {
 	pending map[string]struct{}
@@ -29,6 +30,7 @@ type eventSubscription struct {
 }
 type State struct {
 	mu                              sync.Mutex
+	transport                       sync.Mutex
 	catalog                         *Catalog
 	player                          player.Player
 	queue                           []QueueItem
@@ -42,6 +44,7 @@ type State struct {
 	version                         int64
 	generation                      uint64
 	request                         uint64
+	playbackError                   string
 	subs                            map[*eventSubscription]struct{}
 }
 
@@ -91,10 +94,14 @@ func (s *State) Snapshot() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e := s.elapsed
-	if s.state == "play" {
-		e += time.Since(s.started)
+	if s.state == "play" || s.state == "pause" {
+		if position := s.player.Position(); position > 0 || e == 0 {
+			e = position
+		} else if s.state == "play" {
+			e += time.Since(s.started)
+		}
 	}
-	return Status{s.volume, s.repeat, s.random, s.single, s.consume, s.version, append([]QueueItem(nil), s.queue...), s.state, s.current, e}
+	return Status{s.volume, s.repeat, s.random, s.single, s.consume, s.version, append([]QueueItem(nil), s.queue...), s.state, s.current, e, s.playbackError}
 }
 func (s *State) Add(song ncm.Song) int64 {
 	return s.Insert(song, -1)
@@ -131,7 +138,6 @@ func (s *State) InsertBlock(songs []ncm.Song, pos int) []int64 {
 	return ids
 }
 func (s *State) Clear() {
-	_ = s.player.Stop()
 	s.mu.Lock()
 	s.generation++
 	s.request++
@@ -141,6 +147,9 @@ func (s *State) Clear() {
 	s.elapsed = 0
 	s.version++
 	s.mu.Unlock()
+	s.transport.Lock()
+	_ = s.player.Stop()
+	s.transport.Unlock()
 	s.notify("playlist")
 }
 func (s *State) Delete(pos int) error {
@@ -167,7 +176,9 @@ func (s *State) DeleteRange(start, end int) error {
 	s.version++
 	s.mu.Unlock()
 	if was {
+		s.transport.Lock()
 		_ = s.player.Stop()
+		s.transport.Unlock()
 	}
 	s.notify("playlist")
 	return nil
@@ -277,16 +288,21 @@ func (s *State) playAt(pos int, off time.Duration) error {
 	request := s.request
 	vol := s.volume
 	s.mu.Unlock()
+	return s.playReserved(itemID, song, off, vol, request)
+}
+func (s *State) playReserved(itemID int64, song ncm.Song, off time.Duration, vol int, request uint64) error {
 	info, err := s.catalog.Resolve(song)
 	if err != nil {
 		return fmt.Errorf("song is not playable")
 	}
+	s.transport.Lock()
+	defer s.transport.Unlock()
 	s.mu.Lock()
 	if request != s.request {
 		s.mu.Unlock()
 		return nil
 	}
-	pos = -1
+	pos := -1
 	for i := range s.queue {
 		if s.queue[i].ID == itemID {
 			pos = i
@@ -303,8 +319,9 @@ func (s *State) playAt(pos int, off time.Duration) error {
 	s.elapsed = off
 	s.started = time.Now()
 	s.state = "play"
+	s.playbackError = ""
 	s.mu.Unlock()
-	err = s.player.Play(info.URL, off, vol, func() { s.naturalEnd(gen) })
+	err = s.player.Play(info.URL, info.Type, off, vol, func(err error) { s.playbackEnd(gen, err) })
 	if err != nil {
 		s.mu.Lock()
 		if gen == s.generation {
@@ -317,6 +334,22 @@ func (s *State) playAt(pos int, off time.Duration) error {
 	}
 	s.notify("player")
 	return nil
+}
+func (s *State) playbackEnd(gen uint64, err error) {
+	if err == nil {
+		s.naturalEnd(gen)
+		return
+	}
+	s.mu.Lock()
+	if gen != s.generation {
+		s.mu.Unlock()
+		return
+	}
+	s.state = "stop"
+	s.playbackError = err.Error()
+	s.elapsed = 0
+	s.mu.Unlock()
+	s.notify("player")
 }
 func (s *State) naturalEnd(gen uint64) {
 	s.mu.Lock()
@@ -352,12 +385,22 @@ func (s *State) naturalEnd(gen uint64) {
 	}
 	s.state = "stop"
 	s.elapsed = 0
+	var item QueueItem
+	var request uint64
+	var vol int
+	advance := pos >= 0 && pos < len(s.queue)
+	if advance {
+		item = s.queue[pos]
+		s.request++
+		request = s.request
+		vol = s.volume
+	}
 	s.mu.Unlock()
 	if consumed {
 		s.notify("playlist")
 	}
-	if pos >= 0 {
-		if err := s.playAt(pos, 0); err != nil {
+	if advance {
+		if err := s.playReserved(item.ID, item.Song, 0, vol, request); err != nil {
 			s.notify("player")
 		}
 	} else {
@@ -365,24 +408,28 @@ func (s *State) naturalEnd(gen uint64) {
 	}
 }
 func (s *State) Stop() {
-	_ = s.player.Stop()
 	s.mu.Lock()
 	s.generation++
 	s.request++
 	s.state = "stop"
 	s.elapsed = 0
 	s.mu.Unlock()
+	s.transport.Lock()
+	_ = s.player.Stop()
+	s.transport.Unlock()
 	s.notify("player")
 }
 func (s *State) Pause(on bool) error {
+	s.transport.Lock()
+	defer s.transport.Unlock()
 	st := s.Snapshot()
 	if on {
 		if st.State == "play" {
-			_ = s.player.Stop()
+			if err := s.player.Pause(); err != nil {
+				return err
+			}
 			s.mu.Lock()
-			s.generation++
-			s.request++
-			s.elapsed = st.Elapsed
+			s.elapsed = s.player.Position()
 			s.state = "pause"
 			s.mu.Unlock()
 			s.notify("player")
@@ -390,16 +437,33 @@ func (s *State) Pause(on bool) error {
 		return nil
 	}
 	if st.State == "pause" {
-		return s.playAt(st.Current, st.Elapsed)
+		if err := s.player.Resume(); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.started = time.Now()
+		s.state = "play"
+		s.mu.Unlock()
+		s.notify("player")
 	}
 	return nil
 }
 func (s *State) Seek(off time.Duration) error {
+	s.transport.Lock()
+	defer s.transport.Unlock()
 	st := s.Snapshot()
 	if st.Current < 0 {
 		return fmt.Errorf("no current song")
 	}
-	return s.playAt(st.Current, off)
+	if err := s.player.Seek(off); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.elapsed = off
+	s.started = time.Now()
+	s.mu.Unlock()
+	s.notify("player")
+	return nil
 }
 func (s *State) Next() error {
 	st := s.Snapshot()
@@ -422,6 +486,8 @@ func (s *State) Previous() error {
 	return s.playAt(p, 0)
 }
 func (s *State) SetVolume(v int) error {
+	s.transport.Lock()
+	defer s.transport.Unlock()
 	if v < 0 {
 		v = 0
 	}
@@ -434,8 +500,8 @@ func (s *State) SetVolume(v int) error {
 	s.mu.Unlock()
 	s.notify("mixer")
 	st := s.Snapshot()
-	if st.State == "play" {
-		if err := s.playAt(st.Current, st.Elapsed); err != nil {
+	if st.State == "play" || st.State == "pause" {
+		if err := s.player.SetVolume(v); err != nil {
 			s.mu.Lock()
 			s.volume = old
 			s.mu.Unlock()

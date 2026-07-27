@@ -9,15 +9,18 @@ cookie jar, and resolves temporary playback URLs only when a song starts.
 
 ## Requirements
 
-- `ffplay` available on `PATH` (or supplied with `-ffplay`)
 - Go 1.26 or newer when building from source
+
+Audio playback is built in. net-mpd uses Windows MediaPlayer on Windows,
+AVPlayer on macOS, and Beep/Oto on Linux; no external player is required.
+Linux requires a working PulseAudio-compatible server, or `libasound.so.2` for
+the ALSA fallback.
 
 ## Run
 
 Download the archive for your platform from
 [GitHub Releases](https://github.com/4fuu/net-mpd/releases/latest). Windows
-users should extract `net-mpd.exe`, install an FFmpeg build that provides
-`ffplay.exe`, and ensure it is on `PATH`.
+users only need to extract `net-mpd.exe`.
 
 Log in before starting the server:
 
@@ -45,8 +48,7 @@ The server listens on `127.0.0.1:6600`. Override its settings when needed:
 
 ```powershell
 .\net-mpd.exe -listen 127.0.0.1:16600 `
-  -cookie C:\path\to\net-mpd\cookie `
-  -ffplay C:\path\to\ffplay.exe
+  -cookie C:\path\to\net-mpd\cookie
 ```
 
 ## Login and cookie management
@@ -103,12 +105,13 @@ stored-playlists pane. Songs use stable `netease://song/<id>` MPD URIs.
 - Playlist and directory browsing, artist/album tag views, and cloud search
 - Queue add/load/delete/move/swap/shuffle and command lists
 - Play, pause, stop, seek, next/previous, volume and playback options
+- Native in-process playback controls without restarting the audio stream
+- Library refresh, complete-library listing, and NetEase playlist editing
 - MPD idle notifications and chunked `albumart`/`readpicture` cover delivery
 
-This is intentionally not a complete MPD implementation. Stored-playlist
-editing, database updates, outputs/partitions, stickers, mounts, and
-client-to-client messaging are not supported. Changing volume restarts the
-current `ffplay` stream at the current playback position.
+This is intentionally not a complete MPD implementation. Playlist track
+reordering, outputs/partitions, stickers, mounts, and client-to-client messaging
+are not yet supported.
 
 ## Test
 

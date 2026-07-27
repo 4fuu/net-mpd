@@ -193,6 +193,9 @@ func (c *client) exec(a []string) ([]byte, bool, int, error) {
 			q := st.Queue[st.Current]
 			fmt.Fprintf(&b, "song: %d\nsongid: %d\nelapsed: %.3f\nduration: %.3f\n", st.Current, q.ID, st.Elapsed.Seconds(), q.Song.Duration.Seconds())
 		}
+		if st.Error != "" {
+			fmt.Fprintf(&b, "error: %s\n", st.Error)
+		}
 	case "stats":
 		all, e := c.s.Catalog.AllSongs()
 		if e != nil {

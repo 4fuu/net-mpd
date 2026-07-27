@@ -27,7 +27,6 @@ func main() {
 	}
 	listenAddr := flag.String("listen", "127.0.0.1:6600", "MPD listen address")
 	cookiePath := flag.String("cookie", defaultCookiePath(), "net-mpd cookie file")
-	ffplay := flag.String("ffplay", "ffplay", "ffplay executable path")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -43,7 +42,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("authenticate NetEase session: %v (run %s login)", err, filepath.Base(os.Args[0]))
 	}
-	backend := player.NewFFPlay(*ffplay)
+	backend, err := player.NewNative()
+	if err != nil {
+		log.Fatalf("initialize native audio player: %v", err)
+	}
 	defer backend.Close()
 	state := mpd.NewState(catalog, backend)
 	server := mpd.NewServer(catalog, state)

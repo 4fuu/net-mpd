@@ -96,13 +96,16 @@ func init() {
 	}
 }
 
-func autorelease(body func()) {
+// Autorelease runs body inside an Objective-C autorelease pool on a locked OS thread.
+func Autorelease(body func()) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	p := poolPush()
 	defer poolPop(p)
 	body()
 }
+
+func autorelease(body func()) { Autorelease(body) }
 
 func observerFinish(id objc.ID, _ objc.SEL, note objc.ID) { dispatchNote(id, false, note) }
 func observerFail(id objc.ID, _ objc.SEL, note objc.ID)   { dispatchNote(id, true, note) }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -73,6 +74,9 @@ func (f *fakeMusic) ResolveURL(int64) (ncm.PlayableInfo, error) {
 	return ncm.PlayableInfo{URL: "fake://audio"}, nil
 }
 func (f *fakeMusic) Cover(ncm.Song) ([]byte, error) { return f.cover, nil }
+func (f *fakeMusic) Lyrics(int64) (ncm.Lyrics, error) {
+	return ncm.Lyrics{Original: "[00:00.00]test lyric\n[00:05.00]line two\n"}, nil
+}
 func (f *fakeMusic) CreatePlaylist(name string) (ncm.Playlist, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -585,8 +589,45 @@ func TestGroupedList(t *testing.T) {
 	c, r := connect(t, s)
 	defer c.Close()
 	got := response(t, c, r, `list Album group Artist`)
-	if !strings.Contains(got, "Album: 专辑\nArtist: 艺人\n") {
+	// Group tags must precede the primary tag for rmpc's grouped-list parser.
+	if !strings.Contains(got, "Artist: 艺人\nAlbum: 专辑\n") {
 		t.Fatalf("grouped list response %q", got)
+	}
+}
+
+func TestPlaylistSlashNamesAreSafeForRMPC(t *testing.T) {
+	song := ncm.Song{ID: 9, Title: "slash song", Artists: []string{"a"}, Album: "b", Duration: time.Minute}
+	m := &fakeMusic{
+		song:      song,
+		playlists: []ncm.Playlist{{ID: 2, Name: "25/05", TrackCount: 1}, {ID: 3, Name: "23/11/16", TrackCount: 1}},
+		tracks:    map[int64][]ncm.Song{2: {song}, 3: {song}},
+		nextID:    3,
+	}
+	catalog, err := NewCatalog(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(catalog, NewState(catalog, &fakePlayer{}))
+	c, r := connect(t, s)
+	defer c.Close()
+
+	listed := response(t, c, r, "listplaylists")
+	if strings.Contains(listed, "playlist: 25/05\n") || strings.Contains(listed, "playlist: 23/11/16\n") {
+		t.Fatalf("raw slash names leaked to client: %q", listed)
+	}
+	if !strings.Contains(listed, "playlist: 25／05\n") || !strings.Contains(listed, "playlist: 23／11／16\n") {
+		t.Fatalf("expected sanitized playlist names, got %q", listed)
+	}
+	ls := response(t, c, r, "lsinfo")
+	if !strings.Contains(ls, "playlist: 25／05\n") {
+		t.Fatalf("lsinfo = %q", ls)
+	}
+	// Clients may still send the original NetEase name, the sanitized name, or either form.
+	for _, name := range []string{`"25／05"`, `"25/05"`, `"23／11／16"`, `"23/11/16"`} {
+		got := response(t, c, r, "listplaylistinfo "+name)
+		if !strings.Contains(got, "file: netease://song/9\n") {
+			t.Fatalf("listplaylistinfo %s = %q", name, got)
+		}
 	}
 }
 
@@ -894,5 +935,30 @@ func TestStopInvalidatesReservedNaturalAdvance(t *testing.T) {
 	<-advanceDone
 	if backend.end != nil {
 		t.Fatal("natural end started a successor after Stop completed")
+	}
+}
+
+func TestEnsureLyricsWritesRmpcPath(t *testing.T) {
+	dir := t.TempDir()
+	s, m := fixture(t)
+	s.Catalog.SetLyricsDir(dir)
+	song := m.song
+	if err := s.Catalog.EnsureLyrics(song); err != nil {
+		t.Fatal(err)
+	}
+	path := LRCPath(dir, song.ID)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("expected lrc at %s: %v", path, err)
+	}
+	got := string(b)
+	for _, want := range []string{"[ar:艺人]", "[ti:歌 曲]", "[al:专辑]", "[00:00.00]test lyric"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("lrc missing %q:\n%s", want, got)
+		}
+	}
+	// second call is cached / no-op
+	if err := s.Catalog.EnsureLyrics(song); err != nil {
+		t.Fatal(err)
 	}
 }

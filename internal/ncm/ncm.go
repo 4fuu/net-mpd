@@ -46,6 +46,12 @@ type PlayableInfo struct {
 	Size int64
 }
 
+// Lyrics holds NetEase LRC text. Translated may be empty.
+type Lyrics struct {
+	Original   string
+	Translated string
+}
+
 type Client struct {
 	jar        *cookiejar.Jar
 	cookiePath string
@@ -258,24 +264,81 @@ func (c *Client) SearchSongs(query string, limit int) ([]Song, error) {
 
 func (c *Client) ResolveURL(songID int64) (PlayableInfo, error) {
 	id := strconv.FormatInt(songID, 10)
-	v1 := &service.SongUrlV1Service{ID: id, Level: service.Higher}
+	// Prefer v1, then fall back to the legacy linuxapi endpoint. Some v1 CDN
+	// hosts (or proxy rules in front of them) return 403 even though the API
+	// response looks valid; probe before handing the URL to the player.
+	var candidates []PlayableInfo
+	v1 := &service.SongUrlV1Service{ID: id, Level: service.Standard, EncodeType: "mp3"}
 	c.lockSDK()
 	code, body, callErr := v1.SongUrl()
 	sdkMu.Unlock()
-	if callErr != nil {
-		return PlayableInfo{}, fmt.Errorf("resolve song URL v1: %w", callErr)
+	if callErr == nil {
+		if info, _, err := parseURLResponse("resolve song URL v1", code, body); err == nil {
+			candidates = append(candidates, info)
+		}
 	}
-	info, fallback, err := parseURLResponse("resolve song URL v1", code, body)
-	if err != nil && !fallback {
-		return PlayableInfo{}, err
+	// Higher quality via v1 as a second try when standard is unreachable.
+	v1h := &service.SongUrlV1Service{ID: id, Level: service.Higher, EncodeType: "mp3"}
+	c.lockSDK()
+	code, body, callErr = v1h.SongUrl()
+	sdkMu.Unlock()
+	if callErr == nil {
+		if info, _, err := parseURLResponse("resolve song URL v1 higher", code, body); err == nil {
+			candidates = append(candidates, info)
+		}
 	}
-	if !fallback {
+	for _, br := range []string{"320000", "128000"} {
+		legacy := &service.SongUrlService{ID: id, Br: br}
+		code, body = c.call(legacy.SongUrl)
+		if info, _, err := parseURLResponse("resolve song URL fallback", code, body); err == nil {
+			candidates = append(candidates, info)
+		}
+	}
+	seen := map[string]bool{}
+	var lastErr error
+	for _, info := range candidates {
+		if info.URL == "" || seen[info.URL] {
+			continue
+		}
+		seen[info.URL] = true
+		if err := probePlayableURL(info.URL); err != nil {
+			lastErr = err
+			continue
+		}
+		if info.Type == "" {
+			info.Type = "mp3"
+		}
 		return info, nil
 	}
-	legacy := &service.SongUrlService{ID: id, Br: "320000"}
-	code, body = c.call(legacy.SongUrl)
-	info, _, err = parseURLResponse("resolve song URL fallback", code, body)
-	return info, err
+	if lastErr != nil {
+		return PlayableInfo{}, fmt.Errorf("song is not playable: %w", lastErr)
+	}
+	return PlayableInfo{}, fmt.Errorf("song is not playable (no URL from API)")
+}
+
+// probePlayableURL does a tiny ranged GET so we reject CDN 403/404 before the
+// native player reports a silent stuck "play" state. Full URLs are never logged.
+func probePlayableURL(raw string) error {
+	req, err := http.NewRequest(http.MethodGet, raw, nil)
+	if err != nil {
+		return fmt.Errorf("invalid playback URL: %w", err)
+	}
+	// Preserve '+' in signed query strings; url.Parse keeps them in RawQuery,
+	// but re-encoding via Query() would turn them into spaces.
+	req.Header.Set("Range", "bytes=0-1")
+	req.Header.Set("Referer", "https://music.163.com/")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	client := &http.Client{Timeout: 8 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("playback URL unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64))
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent {
+		return nil
+	}
+	return fmt.Errorf("playback URL HTTP %d", resp.StatusCode)
 }
 
 const maxCoverSize = 10 << 20
@@ -304,6 +367,62 @@ func (c *Client) Cover(song Song) ([]byte, error) {
 		return nil, fmt.Errorf("cover: response exceeds %d bytes", maxCoverSize)
 	}
 	return b, nil
+}
+
+// Lyrics fetches timed LRC lyrics for a song. Missing lyrics return an empty
+// Original without error so callers can skip writing a file.
+func (c *Client) Lyrics(songID int64) (Lyrics, error) {
+	s := &service.LyricService{ID: strconv.FormatInt(songID, 10)}
+	code, body := c.call(s.Lyric)
+	if err := checkResponse("lyrics", code, body); err != nil {
+		return Lyrics{}, err
+	}
+	var r struct {
+		Lrc struct {
+			Lyric string `json:"lyric"`
+		} `json:"lrc"`
+		Tlyric struct {
+			Lyric string `json:"lyric"`
+		} `json:"tlyric"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return Lyrics{}, fmt.Errorf("lyrics: decode response: %w", err)
+	}
+	orig := strings.TrimSpace(r.Lrc.Lyric)
+	// NetEase returns placeholders for instrumentals; treat as empty.
+	if isPlaceholderLyric(orig) {
+		orig = ""
+	}
+	trans := strings.TrimSpace(r.Tlyric.Lyric)
+	if isPlaceholderLyric(trans) {
+		trans = ""
+	}
+	return Lyrics{Original: orig, Translated: trans}, nil
+}
+
+func isPlaceholderLyric(s string) bool {
+	if s == "" {
+		return true
+	}
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		content := line
+		if i := strings.LastIndex(line, "]"); i >= 0 && strings.HasPrefix(line, "[") {
+			content = strings.TrimSpace(line[i+1:])
+		}
+		if content == "" {
+			continue
+		}
+		switch content {
+		case "纯音乐，请欣赏", "暂无歌词", "暂无歌词~":
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 type envelope struct {

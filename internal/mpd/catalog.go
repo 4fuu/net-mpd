@@ -2,6 +2,8 @@ package mpd
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +19,7 @@ type MusicService interface {
 	SearchSongs(string, int) ([]ncm.Song, error)
 	ResolveURL(int64) (ncm.PlayableInfo, error)
 	Cover(ncm.Song) ([]byte, error)
+	Lyrics(int64) (ncm.Lyrics, error)
 	CreatePlaylist(string) (ncm.Playlist, error)
 	RenamePlaylist(int64, string) error
 	DeletePlaylist(int64) error
@@ -36,6 +39,8 @@ type Catalog struct {
 	covers     map[string][]byte
 	coverOrder []string
 	refreshed  time.Time
+	lyricsDir  string
+	lyricsDone map[int64]bool
 }
 
 func NewCatalog(service MusicService) (*Catalog, error) {
@@ -47,14 +52,60 @@ func NewCatalog(service MusicService) (*Catalog, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Catalog{service: service, user: u, playlists: append([]ncm.Playlist(nil), ps...), tracks: make(map[int64][]ncm.Song), byURI: make(map[string]ncm.Song), covers: make(map[string][]byte), refreshed: time.Now()}, nil
+	return &Catalog{service: service, user: u, playlists: append([]ncm.Playlist(nil), ps...), tracks: make(map[int64][]ncm.Song), byURI: make(map[string]ncm.Song), covers: make(map[string][]byte), lyricsDone: map[int64]bool{}, refreshed: time.Now()}, nil
+}
+
+// SetLyricsDir configures where LRC files are written for rmpc.
+// Layout matches rmpc's get_lrc_path for URIs like netease://song/<id>:
+//
+//	<dir>/netease:/song/<id>.lrc
+func (c *Catalog) SetLyricsDir(dir string) {
+	c.mu.Lock()
+	c.lyricsDir = dir
+	c.mu.Unlock()
+}
+func (c *Catalog) LyricsDir() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lyricsDir
+}
+
+// LRCPath is the on-disk path rmpc resolves for SongURI(id).
+func LRCPath(dir string, songID int64) string {
+	return filepath.Join(dir, "netease:", "song", strconv.FormatInt(songID, 10)+".lrc")
 }
 func SongURI(id int64) string     { return "netease://song/" + strconv.FormatInt(id, 10) }
 func (c *Catalog) User() ncm.User { c.mu.RLock(); defer c.mu.RUnlock(); return c.user }
+
+// MPD playlist names must not contain '/': clients such as rmpc treat it as a
+// path separator when parsing lsinfo/listplaylists entries, then call
+// listplaylistinfo with only the final segment and get "playlist not found".
+const playlistPathSafe = "／" // fullwidth solidus, looks like '/' but is not a path sep
+
+func sanitizePlaylistName(name string) string {
+	return strings.ReplaceAll(name, "/", playlistPathSafe)
+}
+
+// PlaylistName is the name exposed over the MPD protocol.
+func PlaylistName(p ncm.Playlist) string { return sanitizePlaylistName(p.Name) }
+
+func playlistNameMatch(p ncm.Playlist, name string) bool {
+	if p.Name == name || strconv.FormatInt(p.ID, 10) == name {
+		return true
+	}
+	safe := sanitizePlaylistName(p.Name)
+	return safe == name || safe == sanitizePlaylistName(name)
+}
+
 func (c *Catalog) Playlists() []ncm.Playlist {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return append([]ncm.Playlist(nil), c.playlists...)
+	out := make([]ncm.Playlist, len(c.playlists))
+	for i, p := range c.playlists {
+		p.Name = PlaylistName(p)
+		out[i] = p
+	}
+	return out
 }
 func (c *Catalog) Playlist(name string) (ncm.Playlist, bool) {
 	name = strings.TrimPrefix(name, "netease://playlist/")
@@ -62,7 +113,8 @@ func (c *Catalog) Playlist(name string) (ncm.Playlist, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for _, p := range c.playlists {
-		if p.Name == name || strconv.FormatInt(p.ID, 10) == name {
+		if playlistNameMatch(p, name) {
+			p.Name = PlaylistName(p)
 			return p, true
 		}
 	}
@@ -150,7 +202,7 @@ func (c *Catalog) refreshLocked(scope string) error {
 		normalized := strings.TrimPrefix(strings.TrimPrefix(scope, "netease://playlist/"), "playlist/")
 		found := false
 		for _, p := range ps {
-			if p.Name == normalized || strconv.FormatInt(p.ID, 10) == normalized {
+			if playlistNameMatch(p, normalized) {
 				found = true
 				break
 			}
@@ -182,6 +234,8 @@ func (c *Catalog) refreshLocked(scope string) error {
 func (c *Catalog) CreatePlaylist(name string, songs []QueueItem) error {
 	c.refreshMu.Lock()
 	defer c.refreshMu.Unlock()
+	// Keep NetEase-side names free of '/', matching what MPD clients see.
+	name = sanitizePlaylistName(name)
 	p, err := c.service.CreatePlaylist(name)
 	if err != nil {
 		return err
@@ -204,6 +258,7 @@ func (c *Catalog) RenamePlaylist(name, newName string) error {
 	if !ok {
 		return fmt.Errorf("playlist not found")
 	}
+	newName = sanitizePlaylistName(newName)
 	if err := c.service.RenamePlaylist(p.ID, newName); err != nil {
 		return err
 	}
@@ -275,6 +330,78 @@ func (c *Catalog) ClearPlaylist(name string) error {
 	return c.refreshLocked("")
 }
 func (c *Catalog) Resolve(s ncm.Song) (ncm.PlayableInfo, error) { return c.service.ResolveURL(s.ID) }
+
+// EnsureLyrics fetches NetEase lyrics and writes an LRC file rmpc can open.
+// Safe to call repeatedly; failures are non-fatal for playback.
+func (c *Catalog) EnsureLyrics(song ncm.Song) error {
+	c.mu.RLock()
+	dir := c.lyricsDir
+	done := c.lyricsDone[song.ID]
+	c.mu.RUnlock()
+	if dir == "" {
+		return nil
+	}
+	path := LRCPath(dir, song.ID)
+	if done {
+		return nil
+	}
+	if st, err := os.Stat(path); err == nil && st.Size() > 0 {
+		c.mu.Lock()
+		c.lyricsDone[song.ID] = true
+		c.mu.Unlock()
+		return nil
+	}
+	ly, err := c.service.Lyrics(song.ID)
+	if err != nil {
+		return err
+	}
+	if ly.Original == "" {
+		c.mu.Lock()
+		c.lyricsDone[song.ID] = true
+		c.mu.Unlock()
+		return nil
+	}
+	body := formatLRC(song, ly)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(body), 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	c.mu.Lock()
+	c.lyricsDone[song.ID] = true
+	c.mu.Unlock()
+	return nil
+}
+
+func formatLRC(song ncm.Song, ly ncm.Lyrics) string {
+	var b strings.Builder
+	if len(song.Artists) > 0 {
+		fmt.Fprintf(&b, "[ar:%s]\n", strings.Join(song.Artists, "/"))
+	}
+	if song.Album != "" {
+		fmt.Fprintf(&b, "[al:%s]\n", song.Album)
+	}
+	if song.Title != "" {
+		fmt.Fprintf(&b, "[ti:%s]\n", song.Title)
+	}
+	fmt.Fprintf(&b, "[by:net-mpd]\n")
+	b.WriteString(strings.TrimRight(ly.Original, "\n"))
+	b.WriteByte('\n')
+	if ly.Translated != "" {
+		// Bilingual: keep original block then translation block so rmpc shows both.
+		b.WriteByte('\n')
+		b.WriteString(strings.TrimRight(ly.Translated, "\n"))
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
 func (c *Catalog) Cover(uri string) ([]byte, error) {
 	c.mu.RLock()
 	b, ok := c.covers[uri]

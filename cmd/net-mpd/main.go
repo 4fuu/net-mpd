@@ -14,6 +14,7 @@ import (
 	"github.com/4fuu/net-mpd/internal/mpd"
 	"github.com/4fuu/net-mpd/internal/ncm"
 	"github.com/4fuu/net-mpd/internal/player"
+	"github.com/4fuu/net-mpd/internal/sysmedia"
 )
 
 var version = "dev"
@@ -26,10 +27,17 @@ func main() {
 		}
 		return
 	}
+	// On macOS AVPlayer needs the AppKit run loop; other platforms just call
+	// runServer directly (see run_*.go).
+	run(runServer)
+}
+
+func runServer() {
 	listenAddr := flag.String("listen", "127.0.0.1:6600", "MPD listen address")
 	cookiePath := flag.String("cookie", defaultCookiePath(), "net-mpd cookie file")
 	password := flag.String("password", os.Getenv("NET_MPD_PASSWORD"), "MPD client password (default NET_MPD_PASSWORD)")
 	stickerPath := flag.String("stickers", "", "sticker JSON file (default beside cookie)")
+	lyricsPath := flag.String("lyrics", "", "lyrics cache directory for rmpc (default beside cookie)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -45,12 +53,29 @@ func main() {
 	if err != nil {
 		log.Fatalf("authenticate NetEase session: %v (run %s login)", err, filepath.Base(os.Args[0]))
 	}
+	if *lyricsPath == "" {
+		*lyricsPath = filepath.Join(filepath.Dir(*cookiePath), "lyrics")
+	}
+	if err := os.MkdirAll(*lyricsPath, 0o700); err != nil {
+		log.Fatalf("lyrics directory: %v", err)
+	}
+	catalog.SetLyricsDir(*lyricsPath)
+	log.Printf("lyrics cache: %s (set rmpc lyrics_dir to this path)", *lyricsPath)
+	// Warm the library cache so rmpc tag browsers (list Artist/Album) are responsive.
+	go func() {
+		if _, err := catalog.AllSongs(); err != nil {
+			log.Printf("library warm-up failed: %v", err)
+		}
+	}()
 	backend, err := player.NewNative()
 	if err != nil {
 		log.Fatalf("initialize native audio player: %v", err)
 	}
 	defer backend.Close()
 	state := mpd.NewState(catalog, backend)
+	media := sysmedia.New(state)
+	defer media.Release()
+	state.AttachMedia(media)
 	server := mpd.NewServer(catalog, state)
 	server.SetPassword(*password)
 	if *stickerPath == "" {

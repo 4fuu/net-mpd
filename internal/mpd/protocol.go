@@ -315,10 +315,13 @@ func (c *client) query(a []string, cmd string) ([]byte, bool, int, error) {
 					dedupeKey := v + "\x00" + strings.Join(groupValues, "\x00")
 					if !seen[dedupeKey] {
 						seen[dedupeKey] = true
-						fmt.Fprintf(&b, "%s: %s\n", key, v)
+						// MPD/rmpc grouped-list parsing treats non-primary tags as
+						// context that applies to the following primary-tag value,
+						// so group fields must be emitted before the primary tag.
 						for i, group := range groups {
 							fmt.Fprintf(&b, "%s: %s\n", canonical(group), groupValues[i])
 						}
+						fmt.Fprintf(&b, "%s: %s\n", key, v)
 					}
 				}
 			}

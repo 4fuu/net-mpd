@@ -2,12 +2,15 @@ package mpd
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/4fuu/net-mpd/internal/ncm"
 	"github.com/4fuu/net-mpd/internal/player"
+	"github.com/4fuu/net-mpd/internal/sysmedia"
 )
 
 type QueueItem struct {
@@ -47,10 +50,19 @@ type State struct {
 	playbackError                   string
 	outputEnabled                   bool
 	subs                            map[*eventSubscription]struct{}
+	media                           sysmedia.Control
 }
 
 func NewState(c *Catalog, p player.Player) *State {
 	return &State{catalog: c, player: p, nextID: 1, current: -1, state: "stop", volume: 100, outputEnabled: true, subs: map[*eventSubscription]struct{}{}}
+}
+
+// AttachMedia connects the OS Now Playing / media-key session.
+func (s *State) AttachMedia(c sysmedia.Control) {
+	s.mu.Lock()
+	s.media = c
+	s.mu.Unlock()
+	s.publishMedia()
 }
 func (s *State) notify(kind string) {
 	s.mu.Lock()
@@ -294,7 +306,17 @@ func (s *State) playAt(pos int, off time.Duration) error {
 func (s *State) playReserved(itemID int64, song ncm.Song, off time.Duration, vol int, request uint64) error {
 	info, err := s.catalog.Resolve(song)
 	if err != nil {
+		log.Printf("resolve song %d failed: %v", song.ID, err)
+		s.mu.Lock()
+		s.playbackError = err.Error()
+		s.state = "stop"
+		s.mu.Unlock()
+		s.notify("player")
 		return fmt.Errorf("song is not playable")
+	}
+	// Write LRC before playback notify so rmpc's SongChanged handler can find it.
+	if err := s.catalog.EnsureLyrics(song); err != nil {
+		log.Printf("lyrics for song %d: %v", song.ID, err)
 	}
 	s.transport.Lock()
 	defer s.transport.Unlock()
@@ -328,16 +350,20 @@ func (s *State) playReserved(itemID int64, song ncm.Song, off time.Duration, vol
 	s.mu.Unlock()
 	err = s.player.Play(info.URL, info.Type, off, vol, func(err error) { s.playbackEnd(gen, err) })
 	if err != nil {
+		log.Printf("start playback for song %d failed: %v", song.ID, err)
 		s.mu.Lock()
 		if gen == s.generation {
 			s.state = "stop"
 			s.elapsed = 0
+			s.playbackError = err.Error()
 		}
 		s.mu.Unlock()
 		s.notify("player")
+		s.publishMedia()
 		return err
 	}
 	s.notify("player")
+	s.publishMedia()
 	return nil
 }
 func (s *State) playbackEnd(gen uint64, err error) {
@@ -354,7 +380,9 @@ func (s *State) playbackEnd(gen uint64, err error) {
 	s.playbackError = err.Error()
 	s.elapsed = 0
 	s.mu.Unlock()
+	log.Printf("playback ended with error: %v", err)
 	s.notify("player")
+	s.publishMedia()
 }
 func (s *State) naturalEnd(gen uint64) {
 	s.mu.Lock()
@@ -407,9 +435,11 @@ func (s *State) naturalEnd(gen uint64) {
 	if advance {
 		if err := s.playReserved(item.ID, item.Song, 0, vol, request); err != nil {
 			s.notify("player")
+			s.publishMedia()
 		}
 	} else {
 		s.notify("player")
+		s.publishMedia()
 	}
 }
 func (s *State) Stop() {
@@ -423,6 +453,7 @@ func (s *State) Stop() {
 	_ = s.player.Stop()
 	s.transport.Unlock()
 	s.notify("player")
+	s.publishMedia()
 }
 func (s *State) Pause(on bool) error {
 	s.transport.Lock()
@@ -451,6 +482,7 @@ func (s *State) Pause(on bool) error {
 			s.mu.Unlock()
 			if committed {
 				s.notify("player")
+				s.publishMedia()
 			}
 		}
 		return nil
@@ -474,6 +506,7 @@ func (s *State) Pause(on bool) error {
 		s.mu.Unlock()
 		if committed {
 			s.notify("player")
+			s.publishMedia()
 		}
 	}
 	return nil
@@ -505,6 +538,7 @@ func (s *State) Seek(off time.Duration) error {
 	s.mu.Unlock()
 	if committed {
 		s.notify("player")
+		s.publishMedia()
 	}
 	return nil
 }
@@ -603,5 +637,52 @@ func (s *State) SetOutputEnabled(enabled bool) {
 	s.transport.Unlock()
 	if changed && !enabled {
 		s.notify("player")
+		s.publishMedia()
 	}
 }
+
+func (s *State) publishMedia() {
+	s.mu.Lock()
+	media := s.media
+	s.mu.Unlock()
+	if media == nil {
+		return
+	}
+	st := s.Snapshot()
+	info := sysmedia.PlayingInfo{State: st.State, Elapsed: st.Elapsed}
+	if st.Current >= 0 && st.Current < len(st.Queue) {
+		song := st.Queue[st.Current].Song
+		info.TrackID = song.ID
+		info.Title = song.Title
+		info.Album = song.Album
+		info.Artist = strings.Join(song.Artists, "/")
+		info.CoverURL = song.CoverURL
+		info.Duration = song.Duration
+	}
+	media.SetPlayingInfo(info)
+}
+
+// sysmedia.Controller implementation (macOS Now Playing remote commands).
+
+func (s *State) CtrlPause() { _ = s.Pause(true) }
+func (s *State) CtrlResume() {
+	st := s.Snapshot()
+	switch st.State {
+	case "pause":
+		_ = s.Pause(false)
+	case "stop":
+		_ = s.Play(-1)
+	}
+}
+func (s *State) CtrlToggle() {
+	st := s.Snapshot()
+	if st.State == "play" {
+		s.CtrlPause()
+		return
+	}
+	s.CtrlResume()
+}
+func (s *State) CtrlStop()                { s.Stop() }
+func (s *State) CtrlNext()                { _ = s.Next() }
+func (s *State) CtrlPrevious()            { _ = s.Previous() }
+func (s *State) CtrlSeek(d time.Duration) { _ = s.Seek(d) }

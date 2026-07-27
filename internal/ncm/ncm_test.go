@@ -1,10 +1,15 @@
 package ncm
 
 import (
+	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	cookiejar "github.com/juju/persistent-cookiejar"
 )
 
 func TestParseAccount(t *testing.T) {
@@ -40,6 +45,87 @@ func TestParseURLResponse(t *testing.T) {
 	_, fallback, err = parseURLResponse("url", 200, []byte(`{"code":200,"data":[{"url":null,"freeTrialInfo":null}]}`))
 	if err == nil || !fallback || !strings.Contains(err.Error(), "not playable") {
 		t.Fatalf("got fallback=%v err=%v", fallback, err)
+	}
+}
+
+func TestOpenCreatesAndSavesCookieJar(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "cookie")
+	c, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(path); err != nil || info.IsDir() {
+		t.Fatalf("cookie file was not created: %v", err)
+	}
+}
+
+func TestPersistentCookieJarCopyCompatibility(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "source-cookie")
+	source, err := cookiejar.New(&cookiejar.Options{Filename: sourcePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse("https://music.163.com")
+	source.SetCookies(u, []*http.Cookie{{
+		Name:    "MUSIC_U",
+		Value:   "test-session",
+		Path:    "/",
+		Expires: time.Now().Add(time.Hour),
+	}})
+	if err := source.Save(); err != nil {
+		t.Fatal(err)
+	}
+	destinationPath := filepath.Join(t.TempDir(), "destination", "cookie")
+	if err := os.MkdirAll(filepath.Dir(destinationPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	sourceBytes, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(destinationPath, sourceBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(destinationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, cookie := range reopened.jar.Cookies(u) {
+		found = found || cookie.Name == "MUSIC_U" && cookie.Value == "test-session"
+	}
+	if !found {
+		t.Fatal("copied MUSIC_U cookie was not found")
+	}
+}
+
+func TestClearLocalCredentialsReportsRemovalFailure(t *testing.T) {
+	c, err := Open(filepath.Join(t.TempDir(), "cookie"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := filepath.Join(t.TempDir(), "not-a-cookie-file")
+	if err := os.Mkdir(blocked, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(blocked, "child"), []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c.cookiePath = blocked
+	if err := c.clearLocalCredentials(); err == nil {
+		t.Fatal("expected local credential removal to fail")
+	}
+}
+
+func TestResponseMessage(t *testing.T) {
+	if got := responseMessage([]byte(`{"code":801,"message":"waiting"}`)); got != "waiting" {
+		t.Fatalf("message = %q", got)
+	}
+	if got := responseMessage([]byte(`{"code":800,"msg":"expired"}`)); got != "expired" {
+		t.Fatalf("msg = %q", got)
 	}
 }
 

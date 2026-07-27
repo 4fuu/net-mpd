@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,30 +48,43 @@ type PlayableInfo struct {
 
 type Client struct {
 	jar        *cookiejar.Jar
+	cookiePath string
 	httpClient *http.Client
 }
 
 var sdkMu sync.Mutex
 
+func (c *Client) lockSDK() {
+	sdkMu.Lock()
+	neteaseutil.SetGlobalCookieJar(c.jar)
+	neteaseutil.HTTPClientTimeout = 15 * time.Second
+}
+
 func Open(cookiePath string) (*Client, error) {
-	info, err := os.Stat(cookiePath)
-	if err != nil {
-		return nil, fmt.Errorf("open cookie jar %q: %w", cookiePath, err)
+	if cookiePath == "" {
+		return nil, errors.New("cookie jar path is empty")
 	}
-	if info.IsDir() {
-		return nil, fmt.Errorf("open cookie jar %q: path is a directory", cookiePath)
+	if info, err := os.Stat(cookiePath); err == nil {
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("open cookie jar %q: path is not a regular file", cookiePath)
+		}
+		if err := os.Chmod(cookiePath, 0600); err != nil {
+			return nil, fmt.Errorf("secure cookie jar %q: %w", cookiePath, err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(cookiePath), 0700); err != nil {
+		return nil, fmt.Errorf("create cookie directory: %w", err)
 	}
 	jar, err := cookiejar.New(&cookiejar.Options{Filename: cookiePath})
 	if err != nil {
 		return nil, fmt.Errorf("load cookie jar %q: %w", cookiePath, err)
 	}
-	return &Client{jar: jar, httpClient: &http.Client{Timeout: 15 * time.Second}}, nil
+	return &Client{jar: jar, cookiePath: cookiePath, httpClient: &http.Client{Timeout: 15 * time.Second}}, nil
 }
 
 func (c *Client) call(fn func() (float64, []byte)) (float64, []byte) {
-	sdkMu.Lock()
+	c.lockSDK()
 	defer sdkMu.Unlock()
-	neteaseutil.SetGlobalCookieJar(c.jar)
 	return fn()
 }
 
@@ -116,8 +130,7 @@ func (c *Client) SearchSongs(query string, limit int) ([]Song, error) {
 func (c *Client) ResolveURL(songID int64) (PlayableInfo, error) {
 	id := strconv.FormatInt(songID, 10)
 	v1 := &service.SongUrlV1Service{ID: id, Level: service.Higher}
-	sdkMu.Lock()
-	neteaseutil.SetGlobalCookieJar(c.jar)
+	c.lockSDK()
 	code, body, callErr := v1.SongUrl()
 	sdkMu.Unlock()
 	if callErr != nil {

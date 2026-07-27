@@ -3,14 +3,12 @@
 [![CI](https://github.com/4fuu/net-mpd/actions/workflows/ci.yml/badge.svg)](https://github.com/4fuu/net-mpd/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/4fuu/net-mpd)](https://github.com/4fuu/net-mpd/releases/latest)
 
-`net-mpd` is an MPD 0.23.5-compatible server that exposes a logged-in
-go-musicfox/NetEase Cloud Music account to MPD clients such as RMPC. It uses
-go-musicfox's existing cookie jar and resolves temporary playback URLs only
-when a song starts.
+`net-mpd` is an MPD 0.23.5-compatible server that exposes a NetEase Cloud Music
+account to MPD clients such as RMPC. It manages its own login and persistent
+cookie jar, and resolves temporary playback URLs only when a song starts.
 
 ## Requirements
 
-- A working, logged-in [go-musicfox](https://github.com/go-musicfox/go-musicfox)
 - `ffplay` available on `PATH` (or supplied with `-ffplay`)
 - Go 1.26 or newer when building from source
 
@@ -21,23 +19,71 @@ Download the archive for your platform from
 users should extract `net-mpd.exe`, install an FFmpeg build that provides
 `ffplay.exe`, and ensure it is on `PATH`.
 
-To build from source instead:
+Log in before starting the server:
 
 ```powershell
-go build ./cmd/net-mpd
+.\net-mpd.exe login
+```
+
+Scan the terminal QR code with the NetEase Cloud Music mobile app and confirm
+the login. net-mpd saves the resulting cookie in its own application directory.
+It does not require Musicfox to be installed.
+
+Then start the server:
+
+```powershell
 .\net-mpd.exe
 ```
 
-The server listens on `127.0.0.1:6600`. It auto-detects standard and Scoop
-go-musicfox cookie locations. Override its settings when needed:
+To build from source:
+
+```powershell
+go build ./cmd/net-mpd
+```
+
+The server listens on `127.0.0.1:6600`. Override its settings when needed:
 
 ```powershell
 .\net-mpd.exe -listen 127.0.0.1:16600 `
-  -cookie C:\path\to\go-musicfox\data\cookie `
+  -cookie C:\path\to\net-mpd\cookie `
   -ffplay C:\path\to\ffplay.exe
 ```
 
-The cookie is loaded in place. It is not copied into this repository or logged.
+## Login and cookie management
+
+```powershell
+# QR-code login
+.\net-mpd.exe login
+
+# Inspect or refresh the current login
+.\net-mpd.exe status
+.\net-mpd.exe refresh
+
+# Show where net-mpd stores its cookie
+.\net-mpd.exe cookie-path
+
+# Revoke the remote session and remove the local cookie
+.\net-mpd.exe logout
+```
+
+The default cookie locations are:
+
+- Windows: `%AppData%\net-mpd\cookie`
+- Linux: `$XDG_CONFIG_HOME/net-mpd/cookie` or `~/.config/net-mpd/cookie`
+- macOS: `~/Library/Application Support/net-mpd/cookie`
+
+Set `NET_MPD_HOME` to move net-mpd's application directory, or use `-cookie`
+with both the authentication command and server invocation.
+
+Existing persistent jars, including a Musicfox jar, can be explicitly imported
+once. This is optional and is not part of the normal login flow:
+
+```powershell
+.\net-mpd.exe import-cookie C:\path\to\existing\cookie
+```
+
+Cookie files are created with owner-only permissions where the operating system
+supports them. Cookie values and temporary playback URLs are never logged.
 
 ## RMPC
 

@@ -19,8 +19,14 @@ import (
 var version = "dev"
 
 func main() {
+	if len(os.Args) > 1 && isAuthCommand(os.Args[1]) {
+		if err := runAuthCommand(os.Args[1], os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	listenAddr := flag.String("listen", "127.0.0.1:6600", "MPD listen address")
-	cookiePath := flag.String("cookie", "", "go-musicfox cookie file (auto-detected by default)")
+	cookiePath := flag.String("cookie", defaultCookiePath(), "net-mpd cookie file")
 	ffplay := flag.String("ffplay", "ffplay", "ffplay executable path")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -29,20 +35,13 @@ func main() {
 		return
 	}
 
-	if *cookiePath == "" {
-		*cookiePath = findCookie()
-	}
-	if *cookiePath == "" {
-		log.Fatal("go-musicfox cookie not found; pass -cookie or set MUSICFOX_COOKIE_FILE")
-	}
-
 	music, err := ncm.Open(*cookiePath)
 	if err != nil {
 		log.Fatal(err)
 	}
 	catalog, err := mpd.NewCatalog(music)
 	if err != nil {
-		log.Fatalf("authenticate with go-musicfox session: %v", err)
+		log.Fatalf("authenticate NetEase session: %v (run %s login)", err, filepath.Base(os.Args[0]))
 	}
 	backend := player.NewFFPlay(*ffplay)
 	defer backend.Close()
@@ -70,44 +69,16 @@ func main() {
 	}
 }
 
-func findCookie() string {
-	if path := os.Getenv("MUSICFOX_COOKIE_FILE"); isFile(path) {
-		return path
-	}
-	var candidates []string
-	if root := os.Getenv("MUSICFOX_ROOT"); root != "" {
-		candidates = append(candidates, filepath.Join(root, "data", "cookie"))
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		candidates = append(candidates,
-			filepath.Join(home, "scoop", "persist", "go-musicfox", "data", "data", "cookie"),
-			filepath.Join(home, ".local", "share", "go-musicfox", "cookie"),
-		)
-	}
-	for _, base := range []string{os.Getenv("XDG_DATA_HOME"), os.Getenv("APPDATA"), os.Getenv("LOCALAPPDATA")} {
-		if base != "" {
-			candidates = append(candidates, filepath.Join(base, "go-musicfox", "cookie"))
-		}
-	}
-	for _, path := range candidates {
-		if isFile(path) {
-			return path
-		}
-	}
-	return ""
-}
-
-func isFile(path string) bool {
-	if path == "" {
-		return false
-	}
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
-}
-
 func init() {
 	flag.Usage = func() {
 		_, _ = fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [options]\n", filepath.Base(os.Args[0]))
 		flag.PrintDefaults()
+		_, _ = fmt.Fprintln(flag.CommandLine.Output(), "\nAuthentication commands:")
+		_, _ = fmt.Fprintln(flag.CommandLine.Output(), "  login          Log in with a NetEase Cloud Music QR code")
+		_, _ = fmt.Fprintln(flag.CommandLine.Output(), "  status         Show the current login")
+		_, _ = fmt.Fprintln(flag.CommandLine.Output(), "  refresh        Refresh and persist the login session")
+		_, _ = fmt.Fprintln(flag.CommandLine.Output(), "  logout         Log out and remove local credentials")
+		_, _ = fmt.Fprintln(flag.CommandLine.Output(), "  import-cookie  Import an existing persistent cookie jar")
+		_, _ = fmt.Fprintln(flag.CommandLine.Output(), "  cookie-path    Print the default cookie path")
 	}
 }

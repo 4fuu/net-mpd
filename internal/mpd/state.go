@@ -45,11 +45,12 @@ type State struct {
 	generation                      uint64
 	request                         uint64
 	playbackError                   string
+	outputEnabled                   bool
 	subs                            map[*eventSubscription]struct{}
 }
 
 func NewState(c *Catalog, p player.Player) *State {
-	return &State{catalog: c, player: p, nextID: 1, current: -1, state: "stop", volume: 100, subs: map[*eventSubscription]struct{}{}}
+	return &State{catalog: c, player: p, nextID: 1, current: -1, state: "stop", volume: 100, outputEnabled: true, subs: map[*eventSubscription]struct{}{}}
 }
 func (s *State) notify(kind string) {
 	s.mu.Lock()
@@ -298,6 +299,10 @@ func (s *State) playReserved(itemID int64, song ncm.Song, off time.Duration, vol
 	s.transport.Lock()
 	defer s.transport.Unlock()
 	s.mu.Lock()
+	if !s.outputEnabled {
+		s.mu.Unlock()
+		return fmt.Errorf("audio output is disabled")
+	}
 	if request != s.request {
 		s.mu.Unlock()
 		return nil
@@ -422,47 +427,85 @@ func (s *State) Stop() {
 func (s *State) Pause(on bool) error {
 	s.transport.Lock()
 	defer s.transport.Unlock()
-	st := s.Snapshot()
+	s.mu.Lock()
+	gen := s.generation
+	state := s.state
+	current := s.current
+	var itemID int64
+	if current >= 0 && current < len(s.queue) {
+		itemID = s.queue[current].ID
+	}
+	s.mu.Unlock()
 	if on {
-		if st.State == "play" {
+		if state == "play" {
 			if err := s.player.Pause(); err != nil {
 				return err
 			}
+			position := s.player.Position()
 			s.mu.Lock()
-			s.elapsed = s.player.Position()
-			s.state = "pause"
+			committed := gen == s.generation && s.state == "play" && s.current == current && current >= 0 && current < len(s.queue) && s.queue[current].ID == itemID
+			if committed {
+				s.elapsed = position
+				s.state = "pause"
+			}
 			s.mu.Unlock()
-			s.notify("player")
+			if committed {
+				s.notify("player")
+			}
 		}
 		return nil
 	}
-	if st.State == "pause" {
+	if state == "pause" {
+		s.mu.Lock()
+		enabled := s.outputEnabled
+		s.mu.Unlock()
+		if !enabled {
+			return fmt.Errorf("audio output is disabled")
+		}
 		if err := s.player.Resume(); err != nil {
 			return err
 		}
 		s.mu.Lock()
-		s.started = time.Now()
-		s.state = "play"
+		committed := gen == s.generation && s.state == "pause" && s.current == current && current >= 0 && current < len(s.queue) && s.queue[current].ID == itemID
+		if committed {
+			s.started = time.Now()
+			s.state = "play"
+		}
 		s.mu.Unlock()
-		s.notify("player")
+		if committed {
+			s.notify("player")
+		}
 	}
 	return nil
 }
 func (s *State) Seek(off time.Duration) error {
 	s.transport.Lock()
 	defer s.transport.Unlock()
-	st := s.Snapshot()
-	if st.Current < 0 {
+	s.mu.Lock()
+	gen := s.generation
+	state := s.state
+	current := s.current
+	var itemID int64
+	if current >= 0 && current < len(s.queue) {
+		itemID = s.queue[current].ID
+	}
+	s.mu.Unlock()
+	if current < 0 {
 		return fmt.Errorf("no current song")
 	}
 	if err := s.player.Seek(off); err != nil {
 		return err
 	}
 	s.mu.Lock()
-	s.elapsed = off
-	s.started = time.Now()
+	committed := gen == s.generation && s.state == state && s.current == current && current < len(s.queue) && s.queue[current].ID == itemID
+	if committed {
+		s.elapsed = off
+		s.started = time.Now()
+	}
 	s.mu.Unlock()
-	s.notify("player")
+	if committed {
+		s.notify("player")
+	}
 	return nil
 }
 func (s *State) Next() error {
@@ -525,4 +568,40 @@ func (s *State) Options(name string, v bool) {
 	}
 	s.mu.Unlock()
 	s.notify("options")
+}
+
+func (s *State) ClearError() bool {
+	s.mu.Lock()
+	changed := s.playbackError != ""
+	s.playbackError = ""
+	s.mu.Unlock()
+	return changed
+}
+
+func (s *State) OutputEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.outputEnabled
+}
+
+// SetOutputEnabled is serialized with backend starts and resumes.
+func (s *State) SetOutputEnabled(enabled bool) {
+	s.transport.Lock()
+	s.mu.Lock()
+	changed := s.outputEnabled != enabled
+	s.outputEnabled = enabled
+	if changed && !enabled {
+		s.generation++
+		s.request++
+		s.state = "stop"
+		s.elapsed = 0
+	}
+	s.mu.Unlock()
+	if changed && !enabled {
+		_ = s.player.Stop()
+	}
+	s.transport.Unlock()
+	if changed && !enabled {
+		s.notify("player")
+	}
 }

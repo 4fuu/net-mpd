@@ -3,6 +3,7 @@ package mpd
 import (
 	"bufio"
 	"bytes"
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"net"
@@ -15,14 +16,26 @@ import (
 )
 
 type Server struct {
-	Catalog *Catalog
-	State   *State
-	started time.Time
-	job     atomic.Uint64
+	Catalog  *Catalog
+	State    *State
+	started  time.Time
+	job      atomic.Uint64
+	password string
+	Stickers *StickerStore
 }
 
 func NewServer(c *Catalog, s *State) *Server {
 	return &Server{Catalog: c, State: s, started: time.Now()}
+}
+
+// SetPassword configures authentication. It must be called before Serve.
+func (s *Server) SetPassword(password string) { s.password = password }
+func (s *Server) SetStickerPath(path string) error {
+	st, e := OpenStickerStore(path)
+	if e == nil {
+		s.Stickers = st
+	}
+	return e
 }
 func (s *Server) Serve(l net.Listener) error {
 	for {
@@ -39,18 +52,19 @@ type request struct {
 	err  error
 }
 type client struct {
-	s      *Server
-	c      net.Conn
-	lines  chan request
-	events *eventSubscription
-	limit  int
-	list   []string
-	listOK bool
+	s             *Server
+	c             net.Conn
+	lines         chan request
+	events        *eventSubscription
+	limit         int
+	list          []string
+	listOK        bool
+	authenticated bool
 }
 
 func (s *Server) handle(conn net.Conn) {
 	events, cancel := s.State.Subscribe()
-	cl := &client{s: s, c: conn, lines: make(chan request, 8), events: events, limit: 8192}
+	cl := &client{s: s, c: conn, lines: make(chan request, 8), events: events, limit: 8192, authenticated: s.password == ""}
 	defer cancel()
 	defer conn.Close()
 	_, _ = io.WriteString(conn, "OK MPD 0.23.5\n")
@@ -88,6 +102,10 @@ func (c *client) process(line string) bool {
 		return true
 	}
 	cmd := strings.ToLower(a[0])
+	if !c.authenticated && cmd != "password" && cmd != "close" {
+		c.write(ack(4, 0, a[0], fmt.Errorf("permission denied")))
+		return true
+	}
 	if cmd == "command_list_begin" || cmd == "command_list_ok_begin" {
 		c.list = []string{}
 		c.listOK = cmd == "command_list_ok_begin"
@@ -133,7 +151,7 @@ func (c *client) process(line string) bool {
 	return !close
 }
 
-var supported = []string{"commands", "ping", "close", "binarylimit", "status", "stats", "update", "rescan", "listall", "listallinfo", "currentsong", "playlistinfo", "playlistid", "idle", "noidle", "lsinfo", "listplaylists", "listplaylist", "listplaylistinfo", "save", "rename", "rm", "playlistadd", "playlistdelete", "playlistclear", "list", "find", "search", "add", "load", "clear", "delete", "deleteid", "move", "moveid", "swap", "swapid", "shuffle", "play", "playid", "pause", "stop", "next", "previous", "seekcur", "setvol", "getvol", "volume", "repeat", "random", "single", "consume", "command_list_begin", "command_list_ok_begin", "command_list_end", "albumart", "readpicture", "findadd", "searchadd"}
+var supported = []string{"password", "commands", "notcommands", "tagtypes", "urlhandlers", "decoders", "clearerror", "outputs", "enableoutput", "disableoutput", "toggleoutput", "sticker", "ping", "close", "binarylimit", "status", "stats", "update", "rescan", "listall", "listallinfo", "currentsong", "playlistinfo", "playlistid", "idle", "noidle", "lsinfo", "listplaylists", "listplaylist", "listplaylistinfo", "save", "rename", "rm", "playlistadd", "playlistdelete", "playlistclear", "list", "find", "search", "add", "load", "clear", "delete", "deleteid", "move", "moveid", "swap", "swapid", "shuffle", "play", "playid", "pause", "stop", "next", "previous", "seekcur", "setvol", "getvol", "volume", "repeat", "random", "single", "consume", "command_list_begin", "command_list_ok_begin", "command_list_end", "albumart", "readpicture", "findadd", "searchadd"}
 
 func arg(a []string, n int) (string, error) {
 	if len(a) <= n {
@@ -171,10 +189,76 @@ func (c *client) exec(a []string) ([]byte, bool, int, error) {
 	st := c.s.State.Snapshot()
 	var b bytes.Buffer
 	switch cmd {
+	case "password":
+		if len(a) != 2 {
+			return nil, false, 2, fmt.Errorf("invalid password arguments")
+		}
+		v, e := arg(a, 1)
+		if e != nil {
+			return nil, false, 2, e
+		}
+		if subtle.ConstantTimeCompare([]byte(v), []byte(c.s.password)) != 1 {
+			return nil, false, 3, fmt.Errorf("incorrect password")
+		}
+		c.authenticated = true
 	case "commands":
 		for _, x := range supported {
 			fmt.Fprintf(&b, "command: %s\n", x)
 		}
+	case "notcommands":
+	case "tagtypes":
+		if len(a) != 1 {
+			return nil, false, 2, fmt.Errorf("tagtypes operations are unsupported")
+		}
+		for _, x := range []string{"Artist", "Album", "Title"} {
+			fmt.Fprintf(&b, "tagtype: %s\n", x)
+		}
+	case "urlhandlers":
+		if len(a) != 1 {
+			return nil, false, 2, fmt.Errorf("invalid urlhandlers arguments")
+		}
+		for _, x := range []string{"http", "https", "netease"} {
+			fmt.Fprintf(&b, "handler: %s\n", x)
+		}
+	case "decoders":
+		if len(a) != 1 {
+			return nil, false, 2, fmt.Errorf("invalid decoders arguments")
+		}
+		for _, x := range []string{"mp3", "flac", "ogg", "wav"} {
+			fmt.Fprintf(&b, "plugin: native\nsuffix: %s\n", x)
+		}
+	case "clearerror":
+		if len(a) != 1 {
+			return nil, false, 2, fmt.Errorf("invalid clearerror arguments")
+		}
+		if c.s.State.ClearError() {
+			c.s.State.Notify("player")
+		}
+	case "outputs":
+		if len(a) != 1 {
+			return nil, false, 2, fmt.Errorf("invalid outputs arguments")
+		}
+		enabled := c.s.State.OutputEnabled()
+		fmt.Fprintf(&b, "outputid: 0\noutputname: Native audio\nplugin: native\noutputenabled: %d\n", bt(enabled))
+	case "enableoutput", "disableoutput", "toggleoutput":
+		if len(a) != 2 {
+			return nil, false, 2, fmt.Errorf("invalid output arguments")
+		}
+		id, e := atoi(a, 1)
+		if e != nil {
+			return nil, false, 2, e
+		}
+		if id != 0 {
+			return nil, false, 50, fmt.Errorf("no such audio output")
+		}
+		old := c.s.State.OutputEnabled()
+		enabled := cmd == "enableoutput" || (cmd == "toggleoutput" && !old)
+		c.s.State.SetOutputEnabled(enabled)
+		if old != enabled {
+			c.s.State.Notify("output")
+		}
+	case "sticker":
+		return c.sticker(a)
 	case "ping":
 	case "close":
 		return nil, true, 0, nil

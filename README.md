@@ -48,8 +48,14 @@ The server listens on `127.0.0.1:6600`. Override its settings when needed:
 
 ```powershell
 .\net-mpd.exe -listen 127.0.0.1:16600 `
-  -cookie C:\path\to\net-mpd\cookie
+  -cookie C:\path\to\net-mpd\cookie `
+  -password "your MPD password"
 ```
+
+The MPD password defaults to `NET_MPD_PASSWORD`; an empty value disables MPD
+authentication. Configure RMPC's `password` field when authentication is on.
+Song stickers persist in `stickers.json` beside the cookie by default (override
+with `-stickers`).
 
 ## Login and cookie management
 
@@ -108,10 +114,12 @@ stored-playlists pane. Songs use stable `netease://song/<id>` MPD URIs.
 - Native in-process playback controls without restarting the audio stream
 - Library refresh, complete-library listing, and NetEase playlist editing
 - MPD idle notifications and chunked `albumart`/`readpicture` cover delivery
+- MPD password authentication, persistent local song stickers, and one
+  toggleable native audio output
 
 This is intentionally not a complete MPD implementation. Playlist track
-reordering, outputs/partitions, stickers, mounts, and client-to-client messaging
-are not yet supported.
+reordering, partitions, mounts, and client-to-client messaging are not yet
+supported.
 
 ## Test
 

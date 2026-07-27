@@ -26,6 +26,7 @@ type MusicService interface {
 
 type Catalog struct {
 	service    MusicService
+	refreshMu  sync.Mutex
 	mu         sync.RWMutex
 	user       ncm.User
 	playlists  []ncm.Playlist
@@ -128,27 +129,31 @@ func (c *Catalog) Search(q string, limit int) ([]ncm.Song, error) {
 }
 func (c *Catalog) LastRefresh() time.Time { c.mu.RLock(); defer c.mu.RUnlock(); return c.refreshed }
 func (c *Catalog) Refresh(scope string) error {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+	return c.refreshLocked(scope)
+}
+func (c *Catalog) refreshLocked(scope string) error {
 	ps, err := c.service.UserPlaylists(c.User().ID)
 	if err != nil {
 		return err
 	}
-	want := ps
 	if scope != "" {
 		normalized := strings.TrimPrefix(strings.TrimPrefix(scope, "netease://playlist/"), "playlist/")
-		want = nil
+		found := false
 		for _, p := range ps {
 			if p.Name == normalized || strconv.FormatInt(p.ID, 10) == normalized {
-				want = []ncm.Playlist{p}
+				found = true
 				break
 			}
 		}
-		if len(want) == 0 {
+		if !found {
 			return fmt.Errorf("playlist not found")
 		}
 	}
-	tracks := make(map[int64][]ncm.Song, len(want))
+	tracks := make(map[int64][]ncm.Song, len(ps))
 	byURI := make(map[string]ncm.Song)
-	for _, p := range want {
+	for _, p := range ps {
 		ss, loadErr := c.service.PlaylistTracks(p.ID)
 		if loadErr != nil {
 			return loadErr
@@ -167,6 +172,8 @@ func (c *Catalog) Refresh(scope string) error {
 	return nil
 }
 func (c *Catalog) CreatePlaylist(name string, songs []QueueItem) error {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
 	p, err := c.service.CreatePlaylist(name)
 	if err != nil {
 		return err
@@ -180,9 +187,11 @@ func (c *Catalog) CreatePlaylist(name string, songs []QueueItem) error {
 			return err
 		}
 	}
-	return c.Refresh("")
+	return c.refreshLocked("")
 }
 func (c *Catalog) RenamePlaylist(name, newName string) error {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
 	p, ok := c.Playlist(name)
 	if !ok {
 		return fmt.Errorf("playlist not found")
@@ -190,9 +199,11 @@ func (c *Catalog) RenamePlaylist(name, newName string) error {
 	if err := c.service.RenamePlaylist(p.ID, newName); err != nil {
 		return err
 	}
-	return c.Refresh("")
+	return c.refreshLocked("")
 }
 func (c *Catalog) DeletePlaylist(name string) error {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
 	p, ok := c.Playlist(name)
 	if !ok {
 		return fmt.Errorf("playlist not found")
@@ -200,9 +211,11 @@ func (c *Catalog) DeletePlaylist(name string) error {
 	if err := c.service.DeletePlaylist(p.ID); err != nil {
 		return err
 	}
-	return c.Refresh("")
+	return c.refreshLocked("")
 }
 func (c *Catalog) AddPlaylistSong(name string, song ncm.Song) error {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
 	p, ok := c.Playlist(name)
 	if !ok {
 		return fmt.Errorf("playlist not found")
@@ -210,9 +223,11 @@ func (c *Catalog) AddPlaylistSong(name string, song ncm.Song) error {
 	if err := c.service.AddPlaylistTracks(p.ID, []int64{song.ID}); err != nil {
 		return err
 	}
-	return c.Refresh("")
+	return c.refreshLocked("")
 }
 func (c *Catalog) DeletePlaylistSong(name string, pos int) error {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
 	p, ok := c.Playlist(name)
 	if !ok {
 		return fmt.Errorf("playlist not found")
@@ -227,9 +242,11 @@ func (c *Catalog) DeletePlaylistSong(name string, pos int) error {
 	if err = c.service.DeletePlaylistTracks(p.ID, []int64{ss[pos].ID}); err != nil {
 		return err
 	}
-	return c.Refresh("")
+	return c.refreshLocked("")
 }
 func (c *Catalog) ClearPlaylist(name string) error {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
 	p, ok := c.Playlist(name)
 	if !ok {
 		return fmt.Errorf("playlist not found")
@@ -247,7 +264,7 @@ func (c *Catalog) ClearPlaylist(name string) error {
 			return err
 		}
 	}
-	return c.Refresh("")
+	return c.refreshLocked("")
 }
 func (c *Catalog) Resolve(s ncm.Song) (ncm.PlayableInfo, error) { return c.service.ResolveURL(s.ID) }
 func (c *Catalog) Cover(uri string) ([]byte, error) {

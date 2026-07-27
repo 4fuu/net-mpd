@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -138,6 +140,35 @@ func (f *fakePlayer) Position() time.Duration     { return f.position }
 func (f *fakePlayer) Stop() error                 { f.end = nil; return nil }
 func (f *fakePlayer) Close() error                { return nil }
 
+type transportBarrierPlayer struct {
+	operation string
+	entered   chan struct{}
+	release   chan struct{}
+	position  time.Duration
+}
+
+func (p *transportBarrierPlayer) wait(operation string) {
+	if p.operation == operation {
+		close(p.entered)
+		<-p.release
+	}
+}
+func (p *transportBarrierPlayer) Play(_, _ string, offset time.Duration, _ int, _ func(error)) error {
+	p.position = offset
+	return nil
+}
+func (p *transportBarrierPlayer) Pause() error  { p.wait("pause"); return nil }
+func (p *transportBarrierPlayer) Resume() error { p.wait("resume"); return nil }
+func (p *transportBarrierPlayer) Seek(at time.Duration) error {
+	p.wait("seek")
+	p.position = at
+	return nil
+}
+func (p *transportBarrierPlayer) SetVolume(int) error     { return nil }
+func (p *transportBarrierPlayer) Position() time.Duration { return p.position }
+func (p *transportBarrierPlayer) Stop() error             { return nil }
+func (p *transportBarrierPlayer) Close() error            { return nil }
+
 type blockingPlayer struct {
 	started chan struct{}
 	release chan struct{}
@@ -209,6 +240,174 @@ func response(t *testing.T, c net.Conn, r *bufio.Reader, cmd string) string {
 		if line == "OK\n" || strings.HasPrefix(line, "ACK ") {
 			return b.String()
 		}
+	}
+}
+
+func TestPasswordAuthenticationIsPerConnection(t *testing.T) {
+	s, _ := fixture(t)
+	s.SetPassword("secret")
+	c1, r1 := connect(t, s)
+	defer c1.Close()
+	c2, r2 := connect(t, s)
+	defer c2.Close()
+	if got := response(t, c1, r1, "status"); !strings.HasPrefix(got, "ACK [4@0]") {
+		t.Fatalf("unauthenticated status = %q", got)
+	}
+	if got := response(t, c1, r1, "command_list_begin"); !strings.HasPrefix(got, "ACK [4@0]") {
+		t.Fatalf("command list bypassed authentication: %q", got)
+	}
+	if got := response(t, c1, r1, "password wrong"); !strings.HasPrefix(got, "ACK [3@0]") {
+		t.Fatalf("wrong password = %q", got)
+	}
+	if got := response(t, c1, r1, "password secret"); got != "OK\n" {
+		t.Fatal(got)
+	}
+	if got := response(t, c1, r1, "ping"); got != "OK\n" {
+		t.Fatal(got)
+	}
+	if got := response(t, c2, r2, "ping"); !strings.HasPrefix(got, "ACK [4@0]") {
+		t.Fatalf("authentication leaked between connections: %q", got)
+	}
+	if got := response(t, c1, r1, "password secret extra"); !strings.HasPrefix(got, "ACK [2@0]") {
+		t.Fatalf("extra password argument = %q", got)
+	}
+}
+
+func TestOutputsProtocolAndPlaybackGating(t *testing.T) {
+	s, music := fixture(t)
+	c, r := connect(t, s)
+	defer c.Close()
+	if got := response(t, c, r, "outputs"); !strings.Contains(got, "outputid: 0\n") || !strings.Contains(got, "outputenabled: 1\n") {
+		t.Fatalf("outputs = %q", got)
+	}
+	if got := response(t, c, r, "disableoutput 9"); !strings.HasPrefix(got, "ACK [50@0]") {
+		t.Fatalf("invalid output = %q", got)
+	}
+	_ = response(t, c, r, `add "netease://song/7"`)
+	if got := response(t, c, r, "play"); got != "OK\n" {
+		t.Fatal(got)
+	}
+	end := s.State.player.(*fakePlayer).end
+	if got := response(t, c, r, "disableoutput 0"); got != "OK\n" {
+		t.Fatal(got)
+	}
+	for _, cmd := range []string{"play", "playid 1", "next", "previous", "pause 0"} {
+		if got := response(t, c, r, cmd); cmd != "pause 0" && !strings.HasPrefix(got, "ACK [50@0]") {
+			t.Errorf("disabled %s = %q", cmd, got)
+		}
+	}
+	// A completion callback already handed to the backend cannot auto-advance.
+	end(nil)
+	if s.State.Snapshot().State != "stop" {
+		t.Fatal("natural completion started playback while output was disabled")
+	}
+	if got := response(t, c, r, "enableoutput 0"); got != "OK\n" {
+		t.Fatal(got)
+	}
+	if got := response(t, c, r, "play"); got != "OK\n" {
+		t.Fatal(got)
+	}
+	_ = music
+	if got := response(t, c, r, "outputs extra"); !strings.HasPrefix(got, "ACK [2@0]") {
+		t.Fatalf("outputs extra = %q", got)
+	}
+}
+
+func TestOutputAndStickerIdleAndStickerProtocol(t *testing.T) {
+	s, _ := fixture(t)
+	if err := s.SetStickerPath(filepath.Join(t.TempDir(), "stickers.json")); err != nil {
+		t.Fatal(err)
+	}
+	c, r := connect(t, s)
+	defer c.Close()
+	commands := []string{
+		`sticker set song "netease://song/7" rating 9.5`,
+		`sticker set song "netease://song/7" note "good song"`,
+	}
+	for _, cmd := range commands {
+		if got := response(t, c, r, cmd); got != "OK\n" {
+			t.Fatalf("%s: %q", cmd, got)
+		}
+	}
+	if got := response(t, c, r, `sticker get song "netease://song/7" rating`); got != "sticker: rating=9.5\nOK\n" {
+		t.Fatal(got)
+	}
+	if got := response(t, c, r, `sticker list song "netease://song/7"`); !strings.Contains(got, "sticker: note=good song\n") {
+		t.Fatal(got)
+	}
+	for _, op := range []string{`> 9`, `>= 9.5`, `!= 8`, `contains .5`} {
+		if got := response(t, c, r, `sticker find song "" rating `+op); !strings.Contains(got, "file: netease://song/7\n") {
+			t.Errorf("operator %s: %q", op, got)
+		}
+	}
+	for _, cmd := range []string{`sticker get album "netease://song/7" rating`, `sticker get song bad rating`, `sticker set song "netease://song/7" "" value`, `sticker get song "netease://song/7" rating extra`} {
+		if got := response(t, c, r, cmd); !strings.HasPrefix(got, "ACK ") {
+			t.Errorf("invalid %s = %q", cmd, got)
+		}
+	}
+	_, _ = io.WriteString(c, "idle sticker\n")
+	time.Sleep(time.Millisecond)
+	s.Stickers.Set("netease://song/7", "x", "y")
+	s.State.Notify("sticker")
+	if got, _ := r.ReadString('\n'); got != "changed: sticker\n" {
+		t.Fatal(got)
+	}
+	if got, _ := r.ReadString('\n'); got != "OK\n" {
+		t.Fatal(got)
+	}
+	if got := response(t, c, r, `sticker delete song "netease://song/7" rating`); got != "OK\n" {
+		t.Fatal(got)
+	}
+	if got := response(t, c, r, `sticker delete song "netease://song/7"`); got != "OK\n" {
+		t.Fatal(got)
+	}
+	_, _ = io.WriteString(c, "idle output\n")
+	time.Sleep(time.Millisecond)
+	c2, r2 := connect(t, s)
+	defer c2.Close()
+	if got := response(t, c2, r2, "disableoutput 0"); got != "OK\n" {
+		t.Fatal(got)
+	}
+	if got, _ := r.ReadString('\n'); got != "changed: output\n" {
+		t.Fatal(got)
+	}
+	if got, _ := r.ReadString('\n'); got != "OK\n" {
+		t.Fatal(got)
+	}
+}
+
+func TestIntrospectionAndClearErrorProtocol(t *testing.T) {
+	s, _ := fixture(t)
+	c, r := connect(t, s)
+	defer c.Close()
+	if got := response(t, c, r, "notcommands"); got != "OK\n" {
+		t.Fatalf("notcommands = %q", got)
+	}
+	for cmd, field := range map[string]string{"tagtypes": "tagtype: Artist\n", "urlhandlers": "handler: http\n", "decoders": "plugin: native\n"} {
+		if got := response(t, c, r, cmd); !strings.Contains(got, field) {
+			t.Errorf("%s = %q", cmd, got)
+		}
+		if got := response(t, c, r, cmd+" extra"); !strings.HasPrefix(got, "ACK [2@0]") {
+			t.Errorf("%s extra = %q", cmd, got)
+		}
+	}
+	s.State.mu.Lock()
+	s.State.playbackError = "boom"
+	s.State.mu.Unlock()
+	sub, cancel := s.State.Subscribe()
+	defer cancel()
+	if got := response(t, c, r, "clearerror"); got != "OK\n" {
+		t.Fatal(got)
+	}
+	if pending := s.State.takePending(sub, nil); len(pending) != 1 || pending[0] != "player" {
+		t.Fatalf("clear event = %v", pending)
+	}
+	_ = response(t, c, r, "clearerror")
+	if pending := s.State.takePending(sub, nil); len(pending) != 0 {
+		t.Fatalf("unchanged clear event = %v", pending)
+	}
+	if got := response(t, c, r, "clearerror extra"); !strings.HasPrefix(got, "ACK [2@0]") {
+		t.Fatal(got)
 	}
 }
 
@@ -451,9 +650,12 @@ func TestUpdateRefreshEventsAndStats(t *testing.T) {
 			t.Errorf("missing idle event %s in %v", want, pending)
 		}
 	}
-	// A scoped refresh must retain all playlists and leave uncached playlists lazy-loadable.
+	// A scoped refresh must publish complete tracks and URI indexes for every playlist.
 	if len(s.Catalog.Playlists()) != 2 {
 		t.Fatalf("scoped refresh lost playlists: %#v", s.Catalog.Playlists())
+	}
+	if song, ok := s.Catalog.Song(SongURI(8)); !ok || song.ID != 8 {
+		t.Fatalf("scoped refresh did not publish unrelated song: %#v, %v", song, ok)
 	}
 	if songs, err := s.Catalog.PlaylistSongs("other"); err != nil || len(songs) != 1 || songs[0].ID != 8 {
 		t.Fatalf("lazy other playlist: %#v, %v", songs, err)
@@ -552,6 +754,63 @@ func TestStopWinsAgainstInFlightBackendStart(t *testing.T) {
 	}
 	if got := s.State.Snapshot().State; got != "stop" {
 		t.Fatalf("state = %q, want stop", got)
+	}
+}
+
+func TestStopWinsAgainstInFlightTransportChanges(t *testing.T) {
+	for _, operation := range []string{"pause", "resume", "seek"} {
+		t.Run(operation, func(t *testing.T) {
+			s, music := fixture(t)
+			backend := &transportBarrierPlayer{}
+			s.State.player = backend
+			s.State.Add(music.song)
+			if err := s.State.Play(0); err != nil {
+				t.Fatal(err)
+			}
+			if operation == "resume" {
+				if err := s.State.Pause(true); err != nil {
+					t.Fatal(err)
+				}
+			}
+			backend.operation = operation
+			backend.entered = make(chan struct{})
+			backend.release = make(chan struct{})
+			done := make(chan error, 1)
+			go func() {
+				switch operation {
+				case "pause":
+					done <- s.State.Pause(true)
+				case "resume":
+					done <- s.State.Pause(false)
+				default:
+					done <- s.State.Seek(time.Minute)
+				}
+			}()
+			<-backend.entered
+			stopDone := make(chan struct{})
+			go func() {
+				s.State.Stop()
+				close(stopDone)
+			}()
+			for {
+				s.State.mu.Lock()
+				stopped := s.State.state == "stop"
+				s.State.mu.Unlock()
+				if stopped {
+					break
+				}
+				runtime.Gosched()
+			}
+			close(backend.release)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			<-stopDone
+			st := s.State.Snapshot()
+			if st.State != "stop" || st.Elapsed != 0 {
+				t.Fatalf("Stop lost to in-flight %s: state=%s elapsed=%s", operation, st.State, st.Elapsed)
+			}
+		})
 	}
 }
 

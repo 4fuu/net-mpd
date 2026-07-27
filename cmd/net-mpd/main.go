@@ -27,6 +27,8 @@ func main() {
 	}
 	listenAddr := flag.String("listen", "127.0.0.1:6600", "MPD listen address")
 	cookiePath := flag.String("cookie", defaultCookiePath(), "net-mpd cookie file")
+	password := flag.String("password", os.Getenv("NET_MPD_PASSWORD"), "MPD client password (default NET_MPD_PASSWORD)")
+	stickerPath := flag.String("stickers", "", "sticker JSON file (default beside cookie)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -49,6 +51,13 @@ func main() {
 	defer backend.Close()
 	state := mpd.NewState(catalog, backend)
 	server := mpd.NewServer(catalog, state)
+	server.SetPassword(*password)
+	if *stickerPath == "" {
+		*stickerPath = filepath.Join(filepath.Dir(*cookiePath), "stickers.json")
+	}
+	if err := server.SetStickerPath(*stickerPath); err != nil {
+		log.Fatalf("open sticker store: %v", err)
+	}
 
 	listener, err := net.Listen("tcp", *listenAddr)
 	if err != nil {

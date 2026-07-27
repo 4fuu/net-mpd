@@ -81,8 +81,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist build/licenses
-          go list -deps -f '{{with .Module}}{{if ne .Path "github.com/4fuu/net-mpd"}}{{.Path}}|{{.Version}}|{{.Dir}}{{end}}{{end}}' ./cmd/net-mpd \
-            | sort -u > build/runtime-modules.txt
+          : > build/runtime-modules.txt
+          for target in windows/amd64 windows/arm64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go list -deps \
+              -f '{{with .Module}}{{if ne .Path "github.com/4fuu/net-mpd"}}{{if .Replace}}{{.Replace.Path}}|{{.Replace.Version}}|{{.Dir}}{{else}}{{.Path}}|{{.Version}}|{{.Dir}}{{end}}{{end}}{{end}}' \
+              ./cmd/net-mpd >> build/runtime-modules.txt
+          done
+          sort -u -o build/runtime-modules.txt build/runtime-modules.txt
           while IFS='|' read -r module module_version module_dir; do
             [[ -n "$module" && -d "$module_dir" ]] || continue
             safe_module="${module//\//_}"
@@ -93,6 +98,8 @@ jobs:
               | sort)
           done < build/runtime-modules.txt
           test -f build/licenses/github.com_cnsilvan_UnblockNeteaseMusic-LICENSE
+          test -f build/licenses/github.com_go-ole_go-ole-LICENSE
+          test -f build/licenses/github.com_go-musicfox_winrt-go-LICENSE
 
           for target in windows/amd64 windows/arm64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             os="${target%/*}"

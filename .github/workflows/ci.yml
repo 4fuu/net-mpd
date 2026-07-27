@@ -39,6 +39,9 @@ jobs:
       - name: Run tests with race detector
         run: go test -race -timeout 60s ./...
 
+      - name: Validate Homebrew formula
+        run: ruby -c Formula/net-mpd.rb
+
       - name: Verify release target builds
         shell: bash
         run: |
@@ -68,3 +71,18 @@ jobs:
 
       - name: Build executable
         run: go build -trimpath -o net-mpd.exe ./cmd/net-mpd
+
+  homebrew:
+    name: Homebrew formula
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Add local tap
+        run: brew tap 4fuu/net-mpd "$GITHUB_WORKSPACE"
+
+      - name: Install and test formula
+        run: |
+          brew install 4fuu/net-mpd/net-mpd
+          brew test 4fuu/net-mpd/net-mpd

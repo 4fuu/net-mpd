@@ -41,21 +41,27 @@ jobs:
           head_commit="$(git rev-parse HEAD)"
           latest_tag="$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n 1)"
 
-          if [[ -n "$latest_tag" ]] \
-            && [[ "$(git rev-list -n 1 "$latest_tag")" == "$head_commit" ]] \
-            && gh release view "$latest_tag" >/dev/null 2>&1; then
-            echo "main is already fully released as $latest_tag"
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          latest_today="$(git tag --list "v$prefix.*" --sort=-version:refname | head -n 1)"
-          if [[ -n "$latest_today" ]]; then
-            revision="${latest_today##*.}"
-            [[ "$revision" =~ ^[0-9]+$ ]] || { echo "invalid release tag: $latest_today" >&2; exit 1; }
-            version="$prefix.$((revision + 1))"
+          if [[ -n "$latest_tag" ]] && [[ "$(git rev-list -n 1 "$latest_tag")" == "$head_commit" ]]; then
+            if is_draft="$(gh release view "$latest_tag" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+              if [[ "$is_draft" == "false" ]]; then
+                echo "main is already fully released as $latest_tag"
+                echo "should_release=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "Removing interrupted draft release $latest_tag before retry"
+              gh release delete "$latest_tag" --yes
+            fi
+            version="${latest_tag#v}"
+            echo "Retrying interrupted release as v$version"
           else
-            version="$prefix.0"
+            latest_today="$(git tag --list "v$prefix.*" --sort=-version:refname | head -n 1)"
+            if [[ -n "$latest_today" ]]; then
+              revision="${latest_today##*.}"
+              [[ "$revision" =~ ^[0-9]+$ ]] || { echo "invalid release tag: $latest_today" >&2; exit 1; }
+              version="$prefix.$((revision + 1))"
+            else
+              version="$prefix.0"
+            fi
           fi
 
           echo "should_release=true" >> "$GITHUB_OUTPUT"
@@ -71,6 +77,7 @@ jobs:
           test -z "$(gofmt -l .)"
           go vet ./...
           go test -race -timeout 60s ./...
+          ruby -c Formula/net-mpd.rb
           git diff --check
 
       - name: Build release archives
@@ -121,6 +128,53 @@ jobs:
             rm -rf "dist/$name"
           done
 
+          DARWIN_AMD64_SHA256="$(sha256sum "dist/net-mpd-$VERSION-darwin-amd64.tar.gz" | cut -d ' ' -f 1)" \
+          DARWIN_ARM64_SHA256="$(sha256sum "dist/net-mpd-$VERSION-darwin-arm64.tar.gz" | cut -d ' ' -f 1)" \
+          LINUX_AMD64_SHA256="$(sha256sum "dist/net-mpd-$VERSION-linux-amd64.tar.gz" | cut -d ' ' -f 1)" \
+          LINUX_ARM64_SHA256="$(sha256sum "dist/net-mpd-$VERSION-linux-arm64.tar.gz" | cut -d ' ' -f 1)" \
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("Formula/net-mpd.rb")
+          formula = path.read_text()
+          formula, count = re.subn(
+              r'^  version "[^"]+"$',
+              f'  version "{os.environ["VERSION"]}"',
+              formula,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if count != 1:
+              raise SystemExit("expected exactly one Homebrew version")
+          for target, variable in {
+              "darwin-amd64": "DARWIN_AMD64_SHA256",
+              "darwin-arm64": "DARWIN_ARM64_SHA256",
+              "linux-amd64": "LINUX_AMD64_SHA256",
+              "linux-arm64": "LINUX_ARM64_SHA256",
+          }.items():
+              formula, count = re.subn(
+                  rf'^      sha256 "[0-9a-f]{{64}}" # {target}$',
+                  f'      sha256 "{os.environ[variable]}" # {target}',
+                  formula,
+                  count=1,
+                  flags=re.MULTILINE,
+              )
+              if count != 1:
+                  raise SystemExit(f"expected exactly one {target} checksum")
+          path.write_text(formula)
+          PY
+          ruby -c Formula/net-mpd.rb
+          git diff --check -- Formula/net-mpd.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/net-mpd.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update Homebrew formula for v$VERSION"
+            git push origin HEAD:main
+          fi
+
           source_name="net-mpd-$VERSION-source"
           mkdir -p "build/$source_name"
           git archive HEAD | tar -x -C "build/$source_name"
@@ -153,6 +207,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.release.outputs.version }}
         run: |
+          git fetch origin --tags
+          if git rev-parse --verify --quiet "refs/tags/v$VERSION" >/dev/null; then
+            test "$(git rev-list -n 1 "v$VERSION")" = "$(git rev-parse HEAD)" || {
+              echo "tag v$VERSION does not point at the release commit" >&2
+              exit 1
+            }
+          fi
           gh release create "v$VERSION" dist/* \
             --target "$(git rev-parse HEAD)" \
             --title "net-mpd v$VERSION" \

@@ -16,6 +16,19 @@ AVPlayer on macOS, and Beep/Oto on Linux; no external player is required.
 Linux requires a working PulseAudio-compatible server, or `libasound.so.2` for
 the ALSA fallback.
 
+### Homebrew
+
+This repository is also a Homebrew tap for macOS and Linux:
+
+```bash
+brew tap 4fuu/net-mpd https://github.com/4fuu/net-mpd
+brew install 4fuu/net-mpd/net-mpd
+```
+
+The formula installs the matching Intel or ARM64 release binary. Each release
+automatically updates [`Formula/net-mpd.rb`](Formula/net-mpd.rb) with the new
+calendar version and archive checksums.
+
 ## Run
 
 Download the archive for your platform from

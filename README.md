@@ -29,6 +29,13 @@ The formula installs the matching Intel or ARM64 release binary. Each release
 automatically updates [`Formula/net-mpd.rb`](Formula/net-mpd.rb) with the new
 calendar version and archive checksums.
 
+After logging in once with `net-mpd login`, run it at user login with Homebrew
+Services:
+
+```bash
+brew services start net-mpd
+```
+
 ## Run
 
 Download the archive for your platform from

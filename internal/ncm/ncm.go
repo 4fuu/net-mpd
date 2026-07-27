@@ -52,7 +52,15 @@ type Client struct {
 	httpClient *http.Client
 }
 
+const (
+	playlistDetailAPI = "https://music.163.com/weapi/v3/playlist/detail"
+	songDetailAPI     = "https://music.163.com/weapi/v3/song/detail"
+	songDetailBatch   = 500
+)
+
 var sdkMu sync.Mutex
+
+type weapiCaller func(string, map[string]interface{}) (float64, []byte, error)
 
 func (c *Client) lockSDK() {
 	sdkMu.Lock()
@@ -110,9 +118,66 @@ func (c *Client) UserPlaylists(uid int64) ([]Playlist, error) {
 }
 
 func (c *Client) PlaylistTracks(id int64) ([]Song, error) {
-	s := &service.PlaylistTrackAllService{Id: strconv.FormatInt(id, 10), S: "0"}
-	code, body := c.call(s.AllTracks)
-	return parsePlaylistTracks("playlist tracks", code, body)
+	c.lockSDK()
+	defer sdkMu.Unlock()
+	return fetchPlaylistTracks(id, func(api string, data map[string]interface{}) (float64, []byte, error) {
+		return neteaseutil.CallWeapi(api, data, c.jar)
+	})
+}
+
+func fetchPlaylistTracks(id int64, call weapiCaller) ([]Song, error) {
+	code, body, err := call(playlistDetailAPI, map[string]interface{}{
+		"id": strconv.FormatInt(id, 10),
+		"n":  "100000",
+		"s":  "0",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("playlist tracks: fetch detail: %w", err)
+	}
+	if err := checkResponse("playlist tracks", code, body); err != nil {
+		return nil, err
+	}
+	var detail struct {
+		Playlist struct {
+			TrackIDs []struct {
+				ID int64 `json:"id"`
+			} `json:"trackIds"`
+		} `json:"playlist"`
+	}
+	if err := json.Unmarshal(body, &detail); err != nil {
+		return nil, fmt.Errorf("playlist tracks: decode detail: %w", err)
+	}
+
+	trackIDs := detail.Playlist.TrackIDs
+	songs := make([]Song, 0, len(trackIDs))
+	for start := 0; start < len(trackIDs); start += songDetailBatch {
+		end := min(start+songDetailBatch, len(trackIDs))
+		ids := make([]string, end-start)
+		refs := make([]struct {
+			ID string `json:"id"`
+		}, end-start)
+		for i, track := range trackIDs[start:end] {
+			ids[i] = strconv.FormatInt(track.ID, 10)
+			refs[i].ID = ids[i]
+		}
+		encodedRefs, err := json.Marshal(refs)
+		if err != nil {
+			return nil, fmt.Errorf("playlist tracks: encode song IDs: %w", err)
+		}
+		code, body, err = call(songDetailAPI, map[string]interface{}{
+			"c":   string(encodedRefs),
+			"ids": "[" + strings.Join(ids, ",") + "]",
+		})
+		if err != nil {
+			return nil, fmt.Errorf("playlist tracks: fetch songs: %w", err)
+		}
+		batch, err := parseSongDetails("playlist tracks", code, body)
+		if err != nil {
+			return nil, err
+		}
+		songs = append(songs, batch...)
+	}
+	return songs, nil
 }
 
 func (c *Client) CreatePlaylist(name string) (Playlist, error) {
@@ -369,6 +434,22 @@ func parsePlaylistTracks(op string, code float64, body []byte) ([]Song, error) {
 }
 func parseSearchSongs(op string, code float64, body []byte) ([]Song, error) {
 	return parseSongsAt(op, code, body, false)
+}
+func parseSongDetails(op string, code float64, body []byte) ([]Song, error) {
+	if err := checkResponse(op, code, body); err != nil {
+		return nil, err
+	}
+	var r struct {
+		Songs []songJSON `json:"songs"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, fmt.Errorf("%s: decode response: %w", op, err)
+	}
+	out := make([]Song, len(r.Songs))
+	for i := range r.Songs {
+		out[i] = convertSong(r.Songs[i])
+	}
+	return out, nil
 }
 func parseSongsAt(op string, code float64, body []byte, playlist bool) ([]Song, error) {
 	if err := checkResponse(op, code, body); err != nil {

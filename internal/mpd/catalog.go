@@ -27,6 +27,7 @@ type MusicService interface {
 type Catalog struct {
 	service    MusicService
 	refreshMu  sync.Mutex
+	loadMu     sync.Mutex
 	mu         sync.RWMutex
 	user       ncm.User
 	playlists  []ncm.Playlist
@@ -75,6 +76,13 @@ func (c *Catalog) PlaylistSongs(name string) ([]ncm.Song, error) {
 	c.mu.RLock()
 	songs, ok := c.tracks[p.ID]
 	c.mu.RUnlock()
+	if !ok {
+		c.loadMu.Lock()
+		defer c.loadMu.Unlock()
+		c.mu.RLock()
+		songs, ok = c.tracks[p.ID]
+		c.mu.RUnlock()
+	}
 	if !ok {
 		loaded, err := c.service.PlaylistTracks(p.ID)
 		if err != nil {

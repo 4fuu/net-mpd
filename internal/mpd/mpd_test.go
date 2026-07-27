@@ -25,6 +25,9 @@ type fakeMusic struct {
 	tracks     map[int64][]ncm.Song
 	nextID     int64
 	mutations  []string
+	trackCalls int
+	trackHit   chan struct{}
+	trackGo    chan struct{}
 	resolveHit chan struct{}
 	resolveGo  chan struct{}
 }
@@ -37,8 +40,19 @@ func (f *fakeMusic) UserPlaylists(int64) ([]ncm.Playlist, error) {
 }
 func (f *fakeMusic) PlaylistTracks(id int64) ([]ncm.Song, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]ncm.Song(nil), f.tracks[id]...), nil
+	f.trackCalls++
+	hit, proceed := f.trackHit, f.trackGo
+	if hit != nil {
+		f.trackHit = nil
+		f.trackGo = nil
+	}
+	tracks := append([]ncm.Song(nil), f.tracks[id]...)
+	f.mu.Unlock()
+	if hit != nil {
+		close(hit)
+		<-proceed
+	}
+	return tracks, nil
 }
 func (f *fakeMusic) SearchSongs(string, int) ([]ncm.Song, error) { return []ncm.Song{f.song}, nil }
 func (f *fakeMusic) ResolveURL(int64) (ncm.PlayableInfo, error) {
@@ -216,6 +230,48 @@ func fixture(t *testing.T) (*Server, *fakeMusic) {
 	}
 	return NewServer(c, NewState(c, &fakePlayer{})), m
 }
+
+func TestPlaylistSongsCoalescesConcurrentLoads(t *testing.T) {
+	trackHit := make(chan struct{})
+	trackGo := make(chan struct{})
+	m := &fakeMusic{
+		playlists: []ncm.Playlist{{ID: 2, Name: "list", TrackCount: 1}},
+		tracks:    map[int64][]ncm.Song{2: {{ID: 7, Title: "song"}}},
+		trackHit:  trackHit,
+		trackGo:   trackGo,
+	}
+	catalog, err := NewCatalog(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errs := make(chan error, 2)
+	go func() {
+		_, err := catalog.PlaylistSongs("list")
+		errs <- err
+	}()
+	<-trackHit
+	secondStarted := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		_, err := catalog.PlaylistSongs("list")
+		errs <- err
+	}()
+	<-secondStarted
+	time.Sleep(10 * time.Millisecond)
+	close(trackGo)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.mu.Lock()
+	calls := m.trackCalls
+	m.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("PlaylistTracks calls = %d, want 1", calls)
+	}
+}
+
 func connect(t *testing.T, s *Server) (net.Conn, *bufio.Reader) {
 	t.Helper()
 	a, b := net.Pipe()

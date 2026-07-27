@@ -1,6 +1,8 @@
 package ncm
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -53,6 +55,71 @@ func TestParseSongShapes(t *testing.T) {
 	long, err := parseSearchSongs("search", 200, []byte(`{"code":200,"result":{"songs":[{"id":3,"name":"long","artists":[{"name":"b"}],"album":{"id":4,"name":"other","picUrl":"pic2"},"duration":5678}]}}`))
 	if err != nil || long[0].AlbumID != 4 || long[0].Duration != 5678*time.Millisecond {
 		t.Fatalf("long: %#v %v", long, err)
+	}
+}
+
+func TestFetchPlaylistTracksUsesWeapiAndBatchesSongDetails(t *testing.T) {
+	trackIDs := make([]map[string]int64, songDetailBatch+1)
+	for i := range trackIDs {
+		trackIDs[i] = map[string]int64{"id": int64(i + 1)}
+	}
+	detail, err := json.Marshal(map[string]interface{}{
+		"code":     200,
+		"playlist": map[string]interface{}{"trackIds": trackIDs},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	call := func(api string, data map[string]interface{}) (float64, []byte, error) {
+		calls++
+		if calls == 1 {
+			if api != playlistDetailAPI || data["id"] != "42" {
+				t.Fatalf("detail call = %q, %#v", api, data)
+			}
+			return 200, detail, nil
+		}
+		if api != songDetailAPI {
+			t.Fatalf("song detail API = %q", api)
+		}
+		want := songDetailBatch
+		start := 1
+		if calls == 3 {
+			want = 1
+			start = songDetailBatch + 1
+		}
+		songs := make([]map[string]interface{}, want)
+		for i := range songs {
+			id := start + i
+			songs[i] = map[string]interface{}{
+				"id":   id,
+				"name": fmt.Sprintf("song-%d", id),
+				"ar":   []map[string]string{{"name": "artist"}},
+				"al":   map[string]interface{}{"id": 9, "name": "album"},
+				"dt":   1000,
+			}
+		}
+		body, err := json.Marshal(map[string]interface{}{"code": 200, "songs": songs})
+		return 200, body, err
+	}
+
+	songs, err := fetchPlaylistTracks(42, call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 || len(songs) != songDetailBatch+1 || songs[len(songs)-1].ID != songDetailBatch+1 {
+		t.Fatalf("calls=%d songs=%d last=%#v", calls, len(songs), songs[len(songs)-1])
+	}
+}
+
+func TestFetchPlaylistTracksReturnsBusinessErrorWithoutRetry(t *testing.T) {
+	calls := 0
+	_, err := fetchPlaylistTracks(42, func(string, map[string]interface{}) (float64, []byte, error) {
+		calls++
+		return 405, []byte(`{"code":405,"message":"too frequent"}`), nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "code 405") || calls != 1 {
+		t.Fatalf("calls=%d err=%v", calls, err)
 	}
 }
 

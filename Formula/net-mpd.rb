@@ -27,6 +27,13 @@ class NetMpd < Formula
     doc.install "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "licenses"
   end
 
+  service do
+    run opt_bin/"net-mpd"
+    keep_alive crashed: true
+  end
+
+  # TODO: Add non-Homebrew service integration after graceful shutdown is implemented.
+
   test do
     assert_equal version.to_s, shell_output("#{bin}/net-mpd -version").strip
   end

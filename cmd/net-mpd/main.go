@@ -19,6 +19,7 @@ import (
 var version = "dev"
 
 func main() {
+	log.SetOutput(sdkLogFilter{Writer: os.Stderr})
 	if len(os.Args) > 1 && isAuthCommand(os.Args[1]) {
 		if err := runAuthCommand(os.Args[1], os.Args[2:]); err != nil {
 			log.Fatal(err)

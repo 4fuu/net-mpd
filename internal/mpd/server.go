@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/4fuu/net-mpd/internal/ncm"
@@ -16,9 +17,13 @@ import (
 type Server struct {
 	Catalog *Catalog
 	State   *State
+	started time.Time
+	job     atomic.Uint64
 }
 
-func NewServer(c *Catalog, s *State) *Server { return &Server{c, s} }
+func NewServer(c *Catalog, s *State) *Server {
+	return &Server{Catalog: c, State: s, started: time.Now()}
+}
 func (s *Server) Serve(l net.Listener) error {
 	for {
 		c, e := l.Accept()
@@ -128,7 +133,7 @@ func (c *client) process(line string) bool {
 	return !close
 }
 
-var supported = []string{"commands", "ping", "close", "binarylimit", "status", "stats", "currentsong", "playlistinfo", "playlistid", "idle", "noidle", "lsinfo", "listplaylists", "listplaylistinfo", "list", "find", "search", "add", "load", "clear", "delete", "deleteid", "move", "moveid", "swap", "swapid", "shuffle", "play", "playid", "pause", "stop", "next", "previous", "seekcur", "setvol", "getvol", "volume", "repeat", "random", "single", "consume", "command_list_begin", "command_list_ok_begin", "command_list_end", "albumart", "readpicture", "findadd", "searchadd"}
+var supported = []string{"commands", "ping", "close", "binarylimit", "status", "stats", "update", "rescan", "listall", "listallinfo", "currentsong", "playlistinfo", "playlistid", "idle", "noidle", "lsinfo", "listplaylists", "listplaylist", "listplaylistinfo", "save", "rename", "rm", "playlistadd", "playlistdelete", "playlistclear", "list", "find", "search", "add", "load", "clear", "delete", "deleteid", "move", "moveid", "swap", "swapid", "shuffle", "play", "playid", "pause", "stop", "next", "previous", "seekcur", "setvol", "getvol", "volume", "repeat", "random", "single", "consume", "command_list_begin", "command_list_ok_begin", "command_list_end", "albumart", "readpicture", "findadd", "searchadd"}
 
 func arg(a []string, n int) (string, error) {
 	if len(a) <= n {
@@ -193,7 +198,40 @@ func (c *client) exec(a []string) ([]byte, bool, int, error) {
 		if e != nil {
 			return nil, false, 50, e
 		}
-		fmt.Fprintf(&b, "artists: %d\nalbums: %d\nsongs: %d\nuptime: 0\nplaytime: 0\ndb_playtime: 0\ndb_update: %d\n", count(all, "artist"), count(all, "album"), len(all), time.Now().Unix())
+		var total time.Duration
+		for _, s := range all {
+			total += s.Duration
+		}
+		fmt.Fprintf(&b, "artists: %d\nalbums: %d\nsongs: %d\nuptime: %d\nplaytime: 0\ndb_playtime: %d\ndb_update: %d\n", count(all, "artist"), count(all, "album"), len(all), int64(time.Since(c.s.started).Seconds()), int64(total.Seconds()), c.s.Catalog.LastRefresh().Unix())
+	case "update", "rescan":
+		scope := ""
+		if len(a) > 1 {
+			scope = a[1]
+		}
+		if e := c.s.Catalog.Refresh(scope); e != nil {
+			return nil, false, 50, e
+		}
+		job := c.s.job.Add(1)
+		fmt.Fprintf(&b, "updating_db: %d\n", job)
+		c.s.State.Notify("update", "database", "stored_playlist")
+	case "listall", "listallinfo":
+		var ss []ncm.Song
+		var e error
+		if len(a) > 1 && a[1] != "" {
+			ss, e = c.s.Catalog.PlaylistSongs(a[1])
+		} else {
+			ss, e = c.s.Catalog.AllSongs()
+		}
+		if e != nil {
+			return nil, false, 50, e
+		}
+		for _, s := range ss {
+			if cmd == "listallinfo" {
+				b.Write(songLines(s, nil))
+			} else {
+				fmt.Fprintf(&b, "file: %s\n", SongURI(s.ID))
+			}
+		}
 	case "currentsong":
 		if st.Current >= 0 && st.Current < len(st.Queue) {
 			q := st.Queue[st.Current]
@@ -240,7 +278,7 @@ func (c *client) exec(a []string) ([]byte, bool, int, error) {
 				b.Write(songLines(s, nil))
 			}
 		}
-	case "listplaylistinfo":
+	case "listplaylist", "listplaylistinfo":
 		name, e := arg(a, 1)
 		if e != nil {
 			return nil, false, 2, e
@@ -250,8 +288,82 @@ func (c *client) exec(a []string) ([]byte, bool, int, error) {
 			return nil, false, 50, e
 		}
 		for _, s := range ss {
-			b.Write(songLines(s, nil))
+			if cmd == "listplaylistinfo" {
+				b.Write(songLines(s, nil))
+			} else {
+				fmt.Fprintf(&b, "file: %s\n", SongURI(s.ID))
+			}
 		}
+	case "save":
+		name, e := arg(a, 1)
+		if e != nil {
+			return nil, false, 2, e
+		}
+		if e = c.s.Catalog.CreatePlaylist(name, st.Queue); e != nil {
+			return nil, false, 50, e
+		}
+		c.s.State.Notify("stored_playlist", "database")
+	case "rename":
+		old, e := arg(a, 1)
+		if e != nil {
+			return nil, false, 2, e
+		}
+		name, e := arg(a, 2)
+		if e != nil {
+			return nil, false, 2, e
+		}
+		if e = c.s.Catalog.RenamePlaylist(old, name); e != nil {
+			return nil, false, 50, e
+		}
+		c.s.State.Notify("stored_playlist", "database")
+	case "rm":
+		name, e := arg(a, 1)
+		if e != nil {
+			return nil, false, 2, e
+		}
+		if e = c.s.Catalog.DeletePlaylist(name); e != nil {
+			return nil, false, 50, e
+		}
+		c.s.State.Notify("stored_playlist", "database")
+	case "playlistadd":
+		name, e := arg(a, 1)
+		if e != nil {
+			return nil, false, 2, e
+		}
+		uri, e := arg(a, 2)
+		if e != nil {
+			return nil, false, 2, e
+		}
+		song, ok := c.s.Catalog.Song(uri)
+		if !ok {
+			return nil, false, 50, fmt.Errorf("song not found")
+		}
+		if e = c.s.Catalog.AddPlaylistSong(name, song); e != nil {
+			return nil, false, 50, e
+		}
+		c.s.State.Notify("stored_playlist", "database")
+	case "playlistdelete":
+		name, e := arg(a, 1)
+		if e != nil {
+			return nil, false, 2, e
+		}
+		pos, e := atoi(a, 2)
+		if e != nil {
+			return nil, false, 2, e
+		}
+		if e = c.s.Catalog.DeletePlaylistSong(name, pos); e != nil {
+			return nil, false, 50, e
+		}
+		c.s.State.Notify("stored_playlist", "database")
+	case "playlistclear":
+		name, e := arg(a, 1)
+		if e != nil {
+			return nil, false, 2, e
+		}
+		if e = c.s.Catalog.ClearPlaylist(name); e != nil {
+			return nil, false, 50, e
+		}
+		c.s.State.Notify("stored_playlist", "database")
 	case "load":
 		name, e := arg(a, 1)
 		if e != nil {

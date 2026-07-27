@@ -115,6 +115,70 @@ func (c *Client) PlaylistTracks(id int64) ([]Song, error) {
 	return parsePlaylistTracks("playlist tracks", code, body)
 }
 
+func (c *Client) CreatePlaylist(name string) (Playlist, error) {
+	s := &service.PlaylistCreateService{Name: name}
+	code, body := c.call(s.PlaylistCreate)
+	if err := checkResponse("create playlist", code, body); err != nil {
+		return Playlist{}, err
+	}
+	return parseCreatedPlaylist(name, body)
+}
+
+func parseCreatedPlaylist(name string, body []byte) (Playlist, error) {
+	var r struct {
+		Playlist struct {
+			ID   int64  `json:"id"`
+			Name string `json:"name"`
+		} `json:"playlist"`
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return Playlist{}, fmt.Errorf("create playlist: decode response: %w", err)
+	}
+	if r.Playlist.ID == 0 {
+		r.Playlist.ID = r.ID
+	}
+	if r.Playlist.ID == 0 {
+		return Playlist{}, errors.New("create playlist: playlist ID missing")
+	}
+	if r.Playlist.Name == "" {
+		r.Playlist.Name = name
+	}
+	return Playlist{ID: r.Playlist.ID, Name: r.Playlist.Name}, nil
+}
+
+func (c *Client) RenamePlaylist(id int64, name string) error {
+	s := &service.PlaylistNameUpdateService{Id: strconv.FormatInt(id, 10), Name: name}
+	code, body := c.call(s.PlaylistNameUpdate)
+	return checkResponse("rename playlist", code, body)
+}
+
+func (c *Client) DeletePlaylist(id int64) error {
+	s := &service.PlaylistDeleteService{ID: strconv.FormatInt(id, 10)}
+	code, body := c.call(s.PlaylistDelete)
+	return checkResponse("delete playlist", code, body)
+}
+
+func (c *Client) AddPlaylistTracks(id int64, songIDs []int64) error {
+	ids := make([]string, len(songIDs))
+	for i, songID := range songIDs {
+		ids[i] = strconv.FormatInt(songID, 10)
+	}
+	s := &service.PlaylistTrackAddService{Id: strconv.FormatInt(id, 10), SongIds: ids}
+	code, body := c.call(s.AddTracks)
+	return checkResponse("add playlist tracks", code, body)
+}
+
+func (c *Client) DeletePlaylistTracks(id int64, songIDs []int64) error {
+	ids := make([]string, len(songIDs))
+	for i, songID := range songIDs {
+		ids[i] = strconv.FormatInt(songID, 10)
+	}
+	s := &service.PlaylistTrackDeleteService{Id: strconv.FormatInt(id, 10), SongIds: ids}
+	code, body := c.call(s.DeleteTracks)
+	return checkResponse("delete playlist tracks", code, body)
+}
+
 func (c *Client) SearchSongs(query string, limit int) ([]Song, error) {
 	if limit < 1 {
 		limit = 1

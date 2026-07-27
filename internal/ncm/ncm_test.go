@@ -26,6 +26,25 @@ func TestParsePlaylist(t *testing.T) {
 	}
 }
 
+func TestParseCreatedPlaylist(t *testing.T) {
+	for _, tc := range []struct {
+		body string
+		name string
+		id   int64
+	}{
+		{`{"playlist":{"id":42,"name":"server name"}}`, "server name", 42},
+		{`{"id":43}`, "requested name", 43},
+	} {
+		got, err := parseCreatedPlaylist("requested name", []byte(tc.body))
+		if err != nil || got.ID != tc.id || got.Name != tc.name {
+			t.Fatalf("parseCreatedPlaylist(%s) = %#v, %v", tc.body, got, err)
+		}
+	}
+	if _, err := parseCreatedPlaylist("name", []byte(`{"playlist":{}}`)); err == nil {
+		t.Fatal("missing playlist ID was accepted")
+	}
+}
+
 func TestParseSongShapes(t *testing.T) {
 	short, err := parsePlaylistTracks("tracks", 200, []byte(`{"code":200,"playlist":{"tracks":[{"id":1,"name":"short","ar":[{"name":"a"}],"al":{"id":2,"name":"album","picUrl":"pic"},"dt":1234}]}}`))
 	if err != nil || short[0].Duration != 1234*time.Millisecond || short[0].Artists[0] != "a" {

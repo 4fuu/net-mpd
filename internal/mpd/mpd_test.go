@@ -5,7 +5,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,16 +15,27 @@ import (
 )
 
 type fakeMusic struct {
+	mu         sync.Mutex
 	song       ncm.Song
 	cover      []byte
 	resolveErr error
+	playlists  []ncm.Playlist
+	tracks     map[int64][]ncm.Song
+	nextID     int64
+	mutations  []string
 }
 
 func (f *fakeMusic) Account() (ncm.User, error) { return ncm.User{ID: 1, Nickname: "测试"}, nil }
 func (f *fakeMusic) UserPlaylists(int64) ([]ncm.Playlist, error) {
-	return []ncm.Playlist{{ID: 2, Name: "中文 列表", TrackCount: 1}}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]ncm.Playlist(nil), f.playlists...), nil
 }
-func (f *fakeMusic) PlaylistTracks(int64) ([]ncm.Song, error)    { return []ncm.Song{f.song}, nil }
+func (f *fakeMusic) PlaylistTracks(id int64) ([]ncm.Song, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]ncm.Song(nil), f.tracks[id]...), nil
+}
 func (f *fakeMusic) SearchSongs(string, int) ([]ncm.Song, error) { return []ncm.Song{f.song}, nil }
 func (f *fakeMusic) ResolveURL(int64) (ncm.PlayableInfo, error) {
 	if f.resolveErr != nil {
@@ -31,6 +44,68 @@ func (f *fakeMusic) ResolveURL(int64) (ncm.PlayableInfo, error) {
 	return ncm.PlayableInfo{URL: "fake://audio"}, nil
 }
 func (f *fakeMusic) Cover(ncm.Song) ([]byte, error) { return f.cover, nil }
+func (f *fakeMusic) CreatePlaylist(name string) (ncm.Playlist, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextID++
+	p := ncm.Playlist{ID: f.nextID, Name: name}
+	f.playlists = append(f.playlists, p)
+	f.tracks[p.ID] = nil
+	f.mutations = append(f.mutations, "create "+name)
+	return p, nil
+}
+func (f *fakeMusic) RenamePlaylist(id int64, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.playlists {
+		if f.playlists[i].ID == id {
+			f.playlists[i].Name = name
+			f.mutations = append(f.mutations, "rename "+name)
+			return nil
+		}
+	}
+	return errors.New("playlist not found")
+}
+func (f *fakeMusic) DeletePlaylist(id int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.playlists {
+		if f.playlists[i].ID == id {
+			f.playlists = append(f.playlists[:i], f.playlists[i+1:]...)
+			delete(f.tracks, id)
+			f.mutations = append(f.mutations, "rm")
+			return nil
+		}
+	}
+	return errors.New("playlist not found")
+}
+func (f *fakeMusic) AddPlaylistTracks(id int64, ids []int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, sid := range ids {
+		if sid == f.song.ID {
+			f.tracks[id] = append(f.tracks[id], f.song)
+		} else {
+			return errors.New("song not found")
+		}
+	}
+	f.mutations = append(f.mutations, "add")
+	return nil
+}
+func (f *fakeMusic) DeletePlaylistTracks(id int64, ids []int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, sid := range ids {
+		for i, s := range f.tracks[id] {
+			if s.ID == sid {
+				f.tracks[id] = append(f.tracks[id][:i], f.tracks[id][i+1:]...)
+				break
+			}
+		}
+	}
+	f.mutations = append(f.mutations, "delete")
+	return nil
+}
 
 type fakePlayer struct{ end func() }
 
@@ -43,7 +118,8 @@ func (f *fakePlayer) Close() error { return nil }
 
 func fixture(t *testing.T) (*Server, *fakeMusic) {
 	t.Helper()
-	m := &fakeMusic{song: ncm.Song{ID: 7, Title: "歌 曲", Artists: []string{"艺人"}, Album: "专辑", Duration: 3 * time.Minute}, cover: []byte{0, 1, 2, 3, 4}}
+	song := ncm.Song{ID: 7, Title: "歌 曲", Artists: []string{"艺人"}, Album: "专辑", Duration: 3 * time.Minute}
+	m := &fakeMusic{song: song, cover: []byte{0, 1, 2, 3, 4}, playlists: []ncm.Playlist{{ID: 2, Name: "中文 列表", TrackCount: 1}, {ID: 3, Name: "other", TrackCount: 1}}, tracks: map[int64][]ncm.Song{2: {song}, 3: {{ID: 8, Title: "Other", Duration: time.Minute}}}, nextID: 3}
 	c, e := NewCatalog(m)
 	if e != nil {
 		t.Fatal(e)
@@ -247,5 +323,149 @@ func TestFailedPlayDoesNotInvalidateActivePlayer(t *testing.T) {
 	activeEnd()
 	if got := s.State.Snapshot().State; got != "stop" {
 		t.Fatalf("active player callback was invalidated; state = %s", got)
+	}
+}
+
+func TestCompatibilityCommandsAndListings(t *testing.T) {
+	s, _ := fixture(t)
+	c, r := connect(t, s)
+	defer c.Close()
+	got := response(t, c, r, "commands")
+	for _, cmd := range []string{"update", "rescan", "listall", "listallinfo", "listplaylist", "save", "rename", "rm", "playlistadd", "playlistdelete", "playlistclear"} {
+		if !strings.Contains(got, "command: "+cmd+"\n") {
+			t.Errorf("commands omitted %s", cmd)
+		}
+	}
+	if strings.Contains(got, "command: playlistmove\n") {
+		t.Error("unsupported playlistmove advertised")
+	}
+	plain := response(t, c, r, `listall "中文 列表"`)
+	if plain != "file: netease://song/7\nOK\n" {
+		t.Fatalf("listall = %q", plain)
+	}
+	info := response(t, c, r, `listallinfo "中文 列表"`)
+	if !strings.Contains(info, "Title: 歌 曲\n") || !strings.Contains(info, "Artist: 艺人\n") {
+		t.Fatalf("listallinfo = %q", info)
+	}
+	if got := response(t, c, r, `listall missing`); !strings.HasPrefix(got, "ACK ") {
+		t.Fatalf("missing scope = %q", got)
+	}
+	if got := response(t, c, r, `listplaylist "中文 列表"`); got != plain {
+		t.Fatalf("listplaylist = %q", got)
+	}
+	if got := response(t, c, r, `listplaylistinfo "中文 列表"`); !strings.Contains(got, "Title: 歌 曲\n") {
+		t.Fatalf("listplaylistinfo = %q", got)
+	}
+}
+
+func TestUpdateRefreshEventsAndStats(t *testing.T) {
+	s, m := fixture(t)
+	c, r := connect(t, s)
+	defer c.Close()
+	sub, cancel := s.State.Subscribe()
+	defer cancel()
+	m.mu.Lock()
+	m.tracks[2] = []ncm.Song{{ID: 9, Title: "fresh", Duration: 2 * time.Minute}}
+	m.mu.Unlock()
+	first := response(t, c, r, `update "中文 列表"`)
+	second := response(t, c, r, "rescan")
+	job := func(v string) int {
+		fields := strings.Fields(v)
+		if len(fields) < 2 {
+			t.Fatalf("job response %q", v)
+		}
+		n, err := strconv.Atoi(fields[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if job(second) <= job(first) {
+		t.Fatalf("non-monotonic jobs: %q %q", first, second)
+	}
+	if got := response(t, c, r, `listall "中文 列表"`); !strings.Contains(got, "netease://song/9") {
+		t.Fatalf("refresh not visible: %q", got)
+	}
+	pending := s.State.takePending(sub, nil)
+	for _, want := range []string{"update", "database", "stored_playlist"} {
+		found := false
+		for _, got := range pending {
+			found = found || got == want
+		}
+		if !found {
+			t.Errorf("missing idle event %s in %v", want, pending)
+		}
+	}
+	// A scoped refresh must retain all playlists and leave uncached playlists lazy-loadable.
+	if len(s.Catalog.Playlists()) != 2 {
+		t.Fatalf("scoped refresh lost playlists: %#v", s.Catalog.Playlists())
+	}
+	if songs, err := s.Catalog.PlaylistSongs("other"); err != nil || len(songs) != 1 || songs[0].ID != 8 {
+		t.Fatalf("lazy other playlist: %#v, %v", songs, err)
+	}
+	stats1 := response(t, c, r, "stats")
+	time.Sleep(5 * time.Millisecond)
+	stats2 := response(t, c, r, "stats")
+	value := func(out, key string) int64 {
+		for _, line := range strings.Split(out, "\n") {
+			if strings.HasPrefix(line, key+": ") {
+				n, err := strconv.ParseInt(strings.TrimPrefix(line, key+": "), 10, 64)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return n
+			}
+		}
+		t.Fatalf("missing %s in %q", key, out)
+		return -1
+	}
+	if value(stats1, "db_update") != value(stats2, "db_update") {
+		t.Error("db_update was not stable")
+	}
+	if value(stats1, "uptime") < 0 {
+		t.Error("negative uptime")
+	}
+	if value(stats1, "db_playtime") != 180 {
+		t.Fatalf("db_playtime = %d", value(stats1, "db_playtime"))
+	}
+}
+
+func TestStoredPlaylistMutations(t *testing.T) {
+	s, _ := fixture(t)
+	c, r := connect(t, s)
+	defer c.Close()
+	_ = response(t, c, r, `add "netease://song/7"`)
+	for _, cmd := range []string{`save saved`, `rename saved renamed`, `playlistadd renamed "netease://song/7"`} {
+		if got := response(t, c, r, cmd); got != "OK\n" {
+			t.Fatalf("%s: %q", cmd, got)
+		}
+	}
+	if got := response(t, c, r, `listplaylist renamed`); strings.Count(got, "file: netease://song/7") != 2 {
+		t.Fatalf("saved/add not visible: %q", got)
+	}
+	if got := response(t, c, r, `playlistdelete renamed 9`); !strings.HasPrefix(got, "ACK ") {
+		t.Fatalf("invalid position = %q", got)
+	}
+	if got := response(t, c, r, `playlistadd renamed unknown`); !strings.HasPrefix(got, "ACK ") {
+		t.Fatalf("unknown URI = %q", got)
+	}
+	got := response(t, c, r, "command_list_begin\nping\nplaylistdelete renamed 9\nping\ncommand_list_end")
+	if !strings.Contains(got, "ACK [50@1]") {
+		t.Fatalf("command-list index = %q", got)
+	}
+	if got := response(t, c, r, `playlistdelete renamed 0`); got != "OK\n" {
+		t.Fatal(got)
+	}
+	if got := response(t, c, r, `playlistclear renamed`); got != "OK\n" {
+		t.Fatal(got)
+	}
+	if got := response(t, c, r, `listplaylist renamed`); got != "OK\n" {
+		t.Fatalf("clear not visible: %q", got)
+	}
+	if got := response(t, c, r, `rm renamed`); got != "OK\n" {
+		t.Fatal(got)
+	}
+	if got := response(t, c, r, `listplaylist renamed`); !strings.HasPrefix(got, "ACK ") {
+		t.Fatalf("rm not visible: %q", got)
 	}
 }

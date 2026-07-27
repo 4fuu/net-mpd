@@ -59,6 +59,11 @@ func (s *State) notify(kind string) {
 	}
 	s.mu.Unlock()
 }
+func (s *State) Notify(kinds ...string) {
+	for _, kind := range kinds {
+		s.notify(kind)
+	}
+}
 func (s *State) Subscribe() (*eventSubscription, func()) {
 	sub := &eventSubscription{pending: make(map[string]struct{}), wake: make(chan struct{}, 1)}
 	s.mu.Lock()

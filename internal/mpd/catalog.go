@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/4fuu/net-mpd/internal/ncm"
 )
@@ -16,6 +17,11 @@ type MusicService interface {
 	SearchSongs(string, int) ([]ncm.Song, error)
 	ResolveURL(int64) (ncm.PlayableInfo, error)
 	Cover(ncm.Song) ([]byte, error)
+	CreatePlaylist(string) (ncm.Playlist, error)
+	RenamePlaylist(int64, string) error
+	DeletePlaylist(int64) error
+	AddPlaylistTracks(int64, []int64) error
+	DeletePlaylistTracks(int64, []int64) error
 }
 
 type Catalog struct {
@@ -27,6 +33,7 @@ type Catalog struct {
 	byURI      map[string]ncm.Song
 	covers     map[string][]byte
 	coverOrder []string
+	refreshed  time.Time
 }
 
 func NewCatalog(service MusicService) (*Catalog, error) {
@@ -38,7 +45,7 @@ func NewCatalog(service MusicService) (*Catalog, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Catalog{service: service, user: u, playlists: append([]ncm.Playlist(nil), ps...), tracks: make(map[int64][]ncm.Song), byURI: make(map[string]ncm.Song), covers: make(map[string][]byte)}, nil
+	return &Catalog{service: service, user: u, playlists: append([]ncm.Playlist(nil), ps...), tracks: make(map[int64][]ncm.Song), byURI: make(map[string]ncm.Song), covers: make(map[string][]byte), refreshed: time.Now()}, nil
 }
 func SongURI(id int64) string     { return "netease://song/" + strconv.FormatInt(id, 10) }
 func (c *Catalog) User() ncm.User { c.mu.RLock(); defer c.mu.RUnlock(); return c.user }
@@ -48,6 +55,8 @@ func (c *Catalog) Playlists() []ncm.Playlist {
 	return append([]ncm.Playlist(nil), c.playlists...)
 }
 func (c *Catalog) Playlist(name string) (ncm.Playlist, bool) {
+	name = strings.TrimPrefix(name, "netease://playlist/")
+	name = strings.TrimPrefix(name, "playlist/")
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for _, p := range c.playlists {
@@ -116,6 +125,129 @@ func (c *Catalog) Search(q string, limit int) ([]ncm.Song, error) {
 		c.mu.Unlock()
 	}
 	return ss, e
+}
+func (c *Catalog) LastRefresh() time.Time { c.mu.RLock(); defer c.mu.RUnlock(); return c.refreshed }
+func (c *Catalog) Refresh(scope string) error {
+	ps, err := c.service.UserPlaylists(c.User().ID)
+	if err != nil {
+		return err
+	}
+	want := ps
+	if scope != "" {
+		normalized := strings.TrimPrefix(strings.TrimPrefix(scope, "netease://playlist/"), "playlist/")
+		want = nil
+		for _, p := range ps {
+			if p.Name == normalized || strconv.FormatInt(p.ID, 10) == normalized {
+				want = []ncm.Playlist{p}
+				break
+			}
+		}
+		if len(want) == 0 {
+			return fmt.Errorf("playlist not found")
+		}
+	}
+	tracks := make(map[int64][]ncm.Song, len(want))
+	byURI := make(map[string]ncm.Song)
+	for _, p := range want {
+		ss, loadErr := c.service.PlaylistTracks(p.ID)
+		if loadErr != nil {
+			return loadErr
+		}
+		tracks[p.ID] = append([]ncm.Song(nil), ss...)
+		for _, s := range ss {
+			byURI[SongURI(s.ID)] = s
+		}
+	}
+	c.mu.Lock()
+	c.playlists = append([]ncm.Playlist(nil), ps...)
+	c.tracks = tracks
+	c.byURI = byURI
+	c.refreshed = time.Now()
+	c.mu.Unlock()
+	return nil
+}
+func (c *Catalog) CreatePlaylist(name string, songs []QueueItem) error {
+	p, err := c.service.CreatePlaylist(name)
+	if err != nil {
+		return err
+	}
+	ids := make([]int64, len(songs))
+	for i := range songs {
+		ids[i] = songs[i].Song.ID
+	}
+	if len(ids) > 0 {
+		if err = c.service.AddPlaylistTracks(p.ID, ids); err != nil {
+			return err
+		}
+	}
+	return c.Refresh("")
+}
+func (c *Catalog) RenamePlaylist(name, newName string) error {
+	p, ok := c.Playlist(name)
+	if !ok {
+		return fmt.Errorf("playlist not found")
+	}
+	if err := c.service.RenamePlaylist(p.ID, newName); err != nil {
+		return err
+	}
+	return c.Refresh("")
+}
+func (c *Catalog) DeletePlaylist(name string) error {
+	p, ok := c.Playlist(name)
+	if !ok {
+		return fmt.Errorf("playlist not found")
+	}
+	if err := c.service.DeletePlaylist(p.ID); err != nil {
+		return err
+	}
+	return c.Refresh("")
+}
+func (c *Catalog) AddPlaylistSong(name string, song ncm.Song) error {
+	p, ok := c.Playlist(name)
+	if !ok {
+		return fmt.Errorf("playlist not found")
+	}
+	if err := c.service.AddPlaylistTracks(p.ID, []int64{song.ID}); err != nil {
+		return err
+	}
+	return c.Refresh("")
+}
+func (c *Catalog) DeletePlaylistSong(name string, pos int) error {
+	p, ok := c.Playlist(name)
+	if !ok {
+		return fmt.Errorf("playlist not found")
+	}
+	ss, err := c.PlaylistSongs(name)
+	if err != nil {
+		return err
+	}
+	if pos < 0 || pos >= len(ss) {
+		return fmt.Errorf("invalid position")
+	}
+	if err = c.service.DeletePlaylistTracks(p.ID, []int64{ss[pos].ID}); err != nil {
+		return err
+	}
+	return c.Refresh("")
+}
+func (c *Catalog) ClearPlaylist(name string) error {
+	p, ok := c.Playlist(name)
+	if !ok {
+		return fmt.Errorf("playlist not found")
+	}
+	ss, err := c.PlaylistSongs(name)
+	if err != nil {
+		return err
+	}
+	ids := make([]int64, len(ss))
+	for i := range ss {
+		ids[i] = ss[i].ID
+	}
+	if len(ids) > 0 {
+		if err = c.service.DeletePlaylistTracks(p.ID, ids); err != nil {
+			return err
+		}
+	}
+	return c.Refresh("")
 }
 func (c *Catalog) Resolve(s ncm.Song) (ncm.PlayableInfo, error) { return c.service.ResolveURL(s.ID) }
 func (c *Catalog) Cover(uri string) ([]byte, error) {

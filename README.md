@@ -1,5 +1,8 @@
 # net-mpd
 
+[![CI](https://github.com/4fuu/net-mpd/actions/workflows/ci.yml/badge.svg)](https://github.com/4fuu/net-mpd/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/4fuu/net-mpd)](https://github.com/4fuu/net-mpd/releases/latest)
+
 `net-mpd` is an MPD 0.23.5-compatible server that exposes a logged-in
 go-musicfox/NetEase Cloud Music account to MPD clients such as RMPC. It uses
 go-musicfox's existing cookie jar and resolves temporary playback URLs only
@@ -12,6 +15,13 @@ when a song starts.
 - Go 1.26 or newer when building from source
 
 ## Run
+
+Download the archive for your platform from
+[GitHub Releases](https://github.com/4fuu/net-mpd/releases/latest). Windows
+users should extract `net-mpd.exe`, install an FFmpeg build that provides
+`ffplay.exe`, and ensure it is on `PATH`.
+
+To build from source instead:
 
 ```powershell
 go build ./cmd/net-mpd
@@ -51,8 +61,8 @@ stored-playlists pane. Songs use stable `netease://song/<id>` MPD URIs.
 
 This is intentionally not a complete MPD implementation. Stored-playlist
 editing, database updates, outputs/partitions, stickers, mounts, and
-client-to-client messaging are not supported. Volume changes take effect on the
-next play, resume, or seek because playback is delegated to `ffplay`.
+client-to-client messaging are not supported. Changing volume restarts the
+current `ffplay` stream at the current playback position.
 
 ## Test
 
@@ -63,3 +73,12 @@ go test ./...
 $env:MUSICFOX_COOKIE_FILE = "C:\path\to\go-musicfox\data\cookie"
 go test -run TestMusicfoxSession -v ./internal/ncm
 ```
+
+## License
+
+The original net-mpd source is available under the [MIT License](LICENSE).
+Release binaries link to GPL-3.0-licensed UnblockNeteaseMusic code through the
+go-musicfox SDK, so the combined binaries are distributed under GPL-3.0 terms.
+Every release includes the applicable license texts, third-party notices, and a
+Corresponding Source archive with vendored dependency sources. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

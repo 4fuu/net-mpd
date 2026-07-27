@@ -7,7 +7,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/4fuuu/net-mpd/internal/ncm"
+	"github.com/4fuu/net-mpd/internal/ncm"
 )
 
 // Lex parses MPD command arguments, preserving UTF-8 and supporting quoted escapes.

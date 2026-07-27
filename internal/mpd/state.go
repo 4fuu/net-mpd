@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/4fuuu/net-mpd/internal/ncm"
-	"github.com/4fuuu/net-mpd/internal/player"
+	"github.com/4fuu/net-mpd/internal/ncm"
+	"github.com/4fuu/net-mpd/internal/player"
 )
 
 type QueueItem struct {

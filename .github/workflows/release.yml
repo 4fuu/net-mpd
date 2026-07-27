@@ -1,0 +1,152 @@
+name: Automatic release
+
+on:
+  schedule:
+    # GitHub cron is UTC. 00:00 UTC is 08:00 in Asia/Hong_Kong.
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: automatic-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish unreleased main commits
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Detect unreleased commits
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          prefix="$(TZ=Asia/Hong_Kong date '+%Y.%-m%d')"
+          head_commit="$(git rev-parse HEAD)"
+          latest_tag="$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n 1)"
+
+          if [[ -n "$latest_tag" ]] \
+            && [[ "$(git rev-list -n 1 "$latest_tag")" == "$head_commit" ]] \
+            && gh release view "$latest_tag" >/dev/null 2>&1; then
+            echo "main is already fully released as $latest_tag"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          latest_today="$(git tag --list "v$prefix.*" --sort=-version:refname | head -n 1)"
+          if [[ -n "$latest_today" ]]; then
+            revision="${latest_today##*.}"
+            [[ "$revision" =~ ^[0-9]+$ ]] || { echo "invalid release tag: $latest_today" >&2; exit 1; }
+            version="$prefix.$((revision + 1))"
+          else
+            version="$prefix.0"
+          fi
+
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing main as v$version"
+
+      - name: Run release quality gate
+        if: steps.release.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod verify
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -race -timeout 60s ./...
+          git diff --check
+
+      - name: Build release archives
+        if: steps.release.outputs.should_release == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist build/licenses
+          go list -deps -f '{{with .Module}}{{if ne .Path "github.com/4fuu/net-mpd"}}{{.Path}}|{{.Version}}|{{.Dir}}{{end}}{{end}}' ./cmd/net-mpd \
+            | sort -u > build/runtime-modules.txt
+          while IFS='|' read -r module module_version module_dir; do
+            [[ -n "$module" && -d "$module_dir" ]] || continue
+            safe_module="${module//\//_}"
+            while IFS= read -r license; do
+              cp "$license" "build/licenses/$safe_module-$(basename "$license")"
+            done < <(find "$module_dir" -maxdepth 1 -type f \
+              \( -iname 'LICENSE*' -o -iname 'LICENCE*' -o -iname 'COPYING*' -o -iname 'NOTICE*' \) \
+              | sort)
+          done < build/runtime-modules.txt
+          test -f build/licenses/github.com_cnsilvan_UnblockNeteaseMusic-LICENSE
+
+          for target in windows/amd64 windows/arm64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            name="net-mpd-$VERSION-$os-$arch"
+            mkdir -p "dist/$name"
+            binary="net-mpd"
+            [[ "$os" == "windows" ]] && binary="net-mpd.exe"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build \
+              -trimpath -ldflags "-s -w -X main.version=$VERSION" \
+              -o "dist/$name/$binary" ./cmd/net-mpd
+            cp README.md LICENSE THIRD_PARTY_NOTICES.md "dist/$name/"
+            cp -R build/licenses "dist/$name/"
+            if [[ "$os" == "windows" ]]; then
+              (cd dist && zip -qr "$name.zip" "$name")
+            else
+              tar -C dist -czf "dist/$name.tar.gz" "$name"
+            fi
+            rm -rf "dist/$name"
+          done
+
+          source_name="net-mpd-$VERSION-source"
+          mkdir -p "build/$source_name"
+          git archive HEAD | tar -x -C "build/$source_name"
+          go mod vendor
+          cp -R vendor "build/$source_name/vendor"
+          tar -C build -czf "dist/$source_name.tar.gz" "$source_name"
+          (cd build && zip -qr "../dist/$source_name.zip" "$source_name")
+          (cd dist && sha256sum net-mpd-* > SHA256SUMS)
+
+      - name: Upload release artifacts
+        if: steps.release.outputs.should_release == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: net-mpd-${{ steps.release.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Confirm main is unchanged
+        if: steps.release.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+
+      - name: Create GitHub Release
+        if: steps.release.outputs.should_release == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          gh release create "v$VERSION" dist/* \
+            --target "$(git rev-parse HEAD)" \
+            --title "net-mpd v$VERSION" \
+            --generate-notes

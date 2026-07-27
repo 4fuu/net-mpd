@@ -1,4 +1,4 @@
-module github.com/4fuuu/net-mpd
+module github.com/4fuu/net-mpd
 
 go 1.26.5
 

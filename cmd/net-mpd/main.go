@@ -11,16 +11,23 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/4fuuu/net-mpd/internal/mpd"
-	"github.com/4fuuu/net-mpd/internal/ncm"
-	"github.com/4fuuu/net-mpd/internal/player"
+	"github.com/4fuu/net-mpd/internal/mpd"
+	"github.com/4fuu/net-mpd/internal/ncm"
+	"github.com/4fuu/net-mpd/internal/player"
 )
+
+var version = "dev"
 
 func main() {
 	listenAddr := flag.String("listen", "127.0.0.1:6600", "MPD listen address")
 	cookiePath := flag.String("cookie", "", "go-musicfox cookie file (auto-detected by default)")
 	ffplay := flag.String("ffplay", "ffplay", "ffplay executable path")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	if *cookiePath == "" {
 		*cookiePath = findCookie()

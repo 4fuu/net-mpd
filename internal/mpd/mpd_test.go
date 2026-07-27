@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/4fuuu/net-mpd/internal/ncm"
+	"github.com/4fuu/net-mpd/internal/ncm"
 )
 
 type fakeMusic struct {

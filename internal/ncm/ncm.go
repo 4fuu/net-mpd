@@ -124,18 +124,28 @@ func (c *Client) UserPlaylists(uid int64) ([]Playlist, error) {
 }
 
 func (c *Client) PlaylistTracks(id int64) ([]Song, error) {
-	c.lockSDK()
-	defer sdkMu.Unlock()
-	return fetchPlaylistTracks(id, func(api string, data map[string]interface{}) (float64, []byte, error) {
-		return neteaseutil.CallWeapi(api, data, c.jar)
-	})
+	return c.PlaylistTracksKnown(id, nil)
 }
 
-func fetchPlaylistTracks(id int64, call weapiCaller) ([]Song, error) {
+// PlaylistTracksKnown is like PlaylistTracks but reuses songs already present in
+// known (keyed by song ID) so overlapping playlists skip song/detail round-trips.
+func (c *Client) PlaylistTracksKnown(id int64, known map[int64]Song) ([]Song, error) {
+	return fetchPlaylistTracks(id, c.weapiCall, known)
+}
+
+func (c *Client) weapiCall(api string, data map[string]interface{}) (float64, []byte, error) {
+	c.lockSDK()
+	defer sdkMu.Unlock()
+	return neteaseutil.CallWeapi(api, data, c.jar)
+}
+
+func fetchPlaylistTracks(id int64, call weapiCaller, known map[int64]Song) ([]Song, error) {
 	code, body, err := call(playlistDetailAPI, map[string]interface{}{
 		"id": strconv.FormatInt(id, 10),
-		"n":  "100000",
-		"s":  "0",
+		// Ask the detail endpoint for as many embedded track objects as it will
+	// give; when present they replace separate song/detail calls.
+		"n": "100000",
+		"s": "0",
 	})
 	if err != nil {
 		return nil, fmt.Errorf("playlist tracks: fetch detail: %w", err)
@@ -148,22 +158,54 @@ func fetchPlaylistTracks(id int64, call weapiCaller) ([]Song, error) {
 			TrackIDs []struct {
 				ID int64 `json:"id"`
 			} `json:"trackIds"`
+			Tracks []songJSON `json:"tracks"`
 		} `json:"playlist"`
 	}
 	if err := json.Unmarshal(body, &detail); err != nil {
 		return nil, fmt.Errorf("playlist tracks: decode detail: %w", err)
 	}
 
+	resolved := make(map[int64]Song, len(detail.Playlist.Tracks)+len(known))
+	for id, s := range known {
+		if s.ID != 0 {
+			resolved[id] = s
+		}
+	}
+	// Embedded tracks from playlist/detail cover the common ≤1000 case without
+	// any song/detail traffic.
+	for i := range detail.Playlist.Tracks {
+		s := convertSong(detail.Playlist.Tracks[i])
+		if s.ID != 0 {
+			resolved[s.ID] = s
+		}
+	}
+
 	trackIDs := detail.Playlist.TrackIDs
-	songs := make([]Song, 0, len(trackIDs))
-	for start := 0; start < len(trackIDs); start += songDetailBatch {
-		end := min(start+songDetailBatch, len(trackIDs))
-		ids := make([]string, end-start)
+	if len(trackIDs) == 0 && len(detail.Playlist.Tracks) > 0 {
+		// Some responses only populate tracks.
+		trackIDs = make([]struct {
+			ID int64 `json:"id"`
+		}, len(detail.Playlist.Tracks))
+		for i := range detail.Playlist.Tracks {
+			trackIDs[i].ID = detail.Playlist.Tracks[i].ID
+		}
+	}
+
+	missing := make([]int64, 0, len(trackIDs))
+	for _, track := range trackIDs {
+		if _, ok := resolved[track.ID]; !ok {
+			missing = append(missing, track.ID)
+		}
+	}
+	for start := 0; start < len(missing); start += songDetailBatch {
+		end := min(start+songDetailBatch, len(missing))
+		batchIDs := missing[start:end]
+		ids := make([]string, len(batchIDs))
 		refs := make([]struct {
 			ID string `json:"id"`
-		}, end-start)
-		for i, track := range trackIDs[start:end] {
-			ids[i] = strconv.FormatInt(track.ID, 10)
+		}, len(batchIDs))
+		for i, songID := range batchIDs {
+			ids[i] = strconv.FormatInt(songID, 10)
 			refs[i].ID = ids[i]
 		}
 		encodedRefs, err := json.Marshal(refs)
@@ -181,7 +223,16 @@ func fetchPlaylistTracks(id int64, call weapiCaller) ([]Song, error) {
 		if err != nil {
 			return nil, err
 		}
-		songs = append(songs, batch...)
+		for _, s := range batch {
+			resolved[s.ID] = s
+		}
+	}
+
+	songs := make([]Song, 0, len(trackIDs))
+	for _, track := range trackIDs {
+		if s, ok := resolved[track.ID]; ok {
+			songs = append(songs, s)
+		}
 	}
 	return songs, nil
 }
@@ -260,6 +311,67 @@ func (c *Client) SearchSongs(query string, limit int) ([]Song, error) {
 	s := &service.SearchService{S: query, Type: "1", Limit: strconv.Itoa(limit), Offset: "0"}
 	code, body := c.call(s.Search)
 	return parseSearchSongs("search songs", code, body)
+}
+
+// DailyRecommendSongs returns today's personalized song recommendations.
+func (c *Client) DailyRecommendSongs() ([]Song, error) {
+	code, body := c.call((&service.RecommendSongsService{}).RecommendSongs)
+	return parseDailyRecommendSongs("daily recommend", code, body)
+}
+
+// PersonalFM returns one batch of Private FM songs (~3 tracks).
+// Callers that want a longer list should invoke it multiple times.
+func (c *Client) PersonalFM() ([]Song, error) {
+	code, body := c.call((&service.PersonalFmService{}).PersonalFm)
+	return parsePersonalFM("personal fm", code, body)
+}
+
+// RecentSongs returns recently played songs (capped by NetEase, default 100).
+func (c *Client) RecentSongs(limit int) ([]Song, error) {
+	if limit < 1 {
+		limit = 100
+	}
+	s := &service.RecordRecentSongsService{Limit: strconv.Itoa(limit)}
+	code, body, err := c.callErr(s.RecordRecentSongs)
+	if err != nil {
+		return nil, fmt.Errorf("recent songs: %w", err)
+	}
+	return parseRecentSongs("recent songs", code, body)
+}
+
+// CloudSongs returns every song in the user's NetEase cloud disk.
+func (c *Client) CloudSongs() ([]Song, error) {
+	var all []Song
+	for offset := 0; ; offset += 100 {
+		s := &service.UserCloudService{Limit: "100", Offset: strconv.Itoa(offset)}
+		code, body := c.call(s.UserCloud)
+		items, more, err := parseCloudSongs("cloud songs", code, body)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, items...)
+		if !more || len(items) == 0 {
+			return all, nil
+		}
+	}
+}
+
+// IntelligenceList returns 心动模式 recommendations seeded by songID within playlistID.
+// playlistID is typically the user's liked-songs playlist (first user playlist).
+func (c *Client) IntelligenceList(songID, playlistID int64) ([]Song, error) {
+	s := &service.PlaymodeIntelligenceListService{
+		SongId:       strconv.FormatInt(songID, 10),
+		PlaylistId:   strconv.FormatInt(playlistID, 10),
+		StartMusicId: strconv.FormatInt(songID, 10),
+	}
+	code, body := c.call(s.PlaymodeIntelligenceList)
+	return parseIntelligenceSongs("intelligence", code, body)
+}
+
+func (c *Client) callErr(fn func() (float64, []byte, error)) (float64, []byte, error) {
+	c.lockSDK()
+	defer sdkMu.Unlock()
+	return fn()
 }
 
 func (c *Client) ResolveURL(songID int64) (PlayableInfo, error) {
@@ -553,6 +665,125 @@ func parsePlaylistTracks(op string, code float64, body []byte) ([]Song, error) {
 }
 func parseSearchSongs(op string, code float64, body []byte) ([]Song, error) {
 	return parseSongsAt(op, code, body, false)
+}
+
+func parseDailyRecommendSongs(op string, code float64, body []byte) ([]Song, error) {
+	if err := checkResponse(op, code, body); err != nil {
+		return nil, err
+	}
+	var r struct {
+		Data struct {
+			DailySongs []songJSON `json:"dailySongs"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, fmt.Errorf("%s: decode response: %w", op, err)
+	}
+	out := make([]Song, len(r.Data.DailySongs))
+	for i := range r.Data.DailySongs {
+		out[i] = convertSong(r.Data.DailySongs[i])
+	}
+	return out, nil
+}
+
+func parsePersonalFM(op string, code float64, body []byte) ([]Song, error) {
+	if err := checkResponse(op, code, body); err != nil {
+		return nil, err
+	}
+	var r struct {
+		Data []songJSON `json:"data"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, fmt.Errorf("%s: decode response: %w", op, err)
+	}
+	out := make([]Song, len(r.Data))
+	for i := range r.Data {
+		out[i] = convertSong(r.Data[i])
+	}
+	return out, nil
+}
+
+func parseRecentSongs(op string, code float64, body []byte) ([]Song, error) {
+	if err := checkResponse(op, code, body); err != nil {
+		return nil, err
+	}
+	var r struct {
+		Data struct {
+			List []struct {
+				ResourceType string   `json:"resourceType"`
+				Data         songJSON `json:"data"`
+			} `json:"list"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, fmt.Errorf("%s: decode response: %w", op, err)
+	}
+	out := make([]Song, 0, len(r.Data.List))
+	for _, item := range r.Data.List {
+		if !strings.EqualFold(item.ResourceType, "SONG") {
+			continue
+		}
+		if item.Data.ID == 0 {
+			continue
+		}
+		out = append(out, convertSong(item.Data))
+	}
+	return out, nil
+}
+
+func parseIntelligenceSongs(op string, code float64, body []byte) ([]Song, error) {
+	if err := checkResponse(op, code, body); err != nil {
+		return nil, err
+	}
+	var r struct {
+		Data []struct {
+			SongInfo songJSON `json:"songInfo"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, fmt.Errorf("%s: decode response: %w", op, err)
+	}
+	out := make([]Song, 0, len(r.Data))
+	for i := range r.Data {
+		s := convertSong(r.Data[i].SongInfo)
+		if s.ID == 0 {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+func parseCloudSongs(op string, code float64, body []byte) ([]Song, bool, error) {
+	if err := checkResponse(op, code, body); err != nil {
+		return nil, false, err
+	}
+	var r struct {
+		HasMore bool `json:"hasMore"`
+		Data    []struct {
+			SongID     int64    `json:"songId"`
+			SongName   string   `json:"songName"`
+			SimpleSong songJSON `json:"simpleSong"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, false, fmt.Errorf("%s: decode response: %w", op, err)
+	}
+	out := make([]Song, 0, len(r.Data))
+	for _, item := range r.Data {
+		s := convertSong(item.SimpleSong)
+		if s.ID == 0 {
+			s.ID = item.SongID
+		}
+		if s.Title == "" {
+			s.Title = item.SongName
+		}
+		if s.ID == 0 {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out, r.HasMore, nil
 }
 func parseSongDetails(op string, code float64, body []byte) ([]Song, error) {
 	if err := checkResponse(op, code, body); err != nil {

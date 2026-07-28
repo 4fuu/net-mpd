@@ -40,6 +40,9 @@ func (f *fakeMusic) UserPlaylists(int64) ([]ncm.Playlist, error) {
 	return append([]ncm.Playlist(nil), f.playlists...), nil
 }
 func (f *fakeMusic) PlaylistTracks(id int64) ([]ncm.Song, error) {
+	return f.PlaylistTracksKnown(id, nil)
+}
+func (f *fakeMusic) PlaylistTracksKnown(id int64, known map[int64]ncm.Song) ([]ncm.Song, error) {
 	f.mu.Lock()
 	f.trackCalls++
 	hit, proceed := f.trackHit, f.trackGo
@@ -53,9 +56,39 @@ func (f *fakeMusic) PlaylistTracks(id int64) ([]ncm.Song, error) {
 		close(hit)
 		<-proceed
 	}
-	return tracks, nil
+	if len(known) == 0 {
+		return tracks, nil
+	}
+	// Mirror production: prefer caller-known metadata when IDs match.
+	out := make([]ncm.Song, len(tracks))
+	for i, s := range tracks {
+		if k, ok := known[s.ID]; ok {
+			out[i] = k
+		} else {
+			out[i] = s
+		}
+	}
+	return out, nil
 }
 func (f *fakeMusic) SearchSongs(string, int) ([]ncm.Song, error) { return []ncm.Song{f.song}, nil }
+func (f *fakeMusic) DailyRecommendSongs() ([]ncm.Song, error) {
+	return []ncm.Song{{ID: 101, Title: "daily", Duration: time.Minute}}, nil
+}
+func (f *fakeMusic) PersonalFM() ([]ncm.Song, error) {
+	return []ncm.Song{{ID: 102, Title: "fm", Duration: time.Minute}}, nil
+}
+func (f *fakeMusic) RecentSongs(int) ([]ncm.Song, error) {
+	return []ncm.Song{{ID: 103, Title: "recent", Duration: time.Minute}}, nil
+}
+func (f *fakeMusic) CloudSongs() ([]ncm.Song, error) {
+	return []ncm.Song{{ID: 104, Title: "cloud", Duration: time.Minute}}, nil
+}
+func (f *fakeMusic) IntelligenceList(songID, playlistID int64) ([]ncm.Song, error) {
+	return []ncm.Song{
+		{ID: 201, Title: "intel-a", Duration: time.Minute},
+		{ID: 202, Title: "intel-b", Duration: time.Minute},
+	}, nil
+}
 func (f *fakeMusic) ResolveURL(int64) (ncm.PlayableInfo, error) {
 	f.mu.Lock()
 	err, hit, proceed := f.resolveErr, f.resolveHit, f.resolveGo
@@ -615,15 +648,16 @@ func TestPlaylistSlashNamesAreSafeForRMPC(t *testing.T) {
 	if strings.Contains(listed, "playlist: 25/05\n") || strings.Contains(listed, "playlist: 23/11/16\n") {
 		t.Fatalf("raw slash names leaked to client: %q", listed)
 	}
-	if !strings.Contains(listed, "playlist: 25／05\n") || !strings.Contains(listed, "playlist: 23／11／16\n") {
-		t.Fatalf("expected sanitized playlist names, got %q", listed)
+	// All playlists carry zero-padded order prefixes; slashes stay sanitized.
+	if !strings.Contains(listed, "playlist: 01 - 25／05\n") || !strings.Contains(listed, "playlist: 07 - 23／11／16\n") {
+		t.Fatalf("expected ordered sanitized playlist names, got %q", listed)
 	}
 	ls := response(t, c, r, "lsinfo")
-	if !strings.Contains(ls, "playlist: 25／05\n") {
+	if !strings.Contains(ls, "playlist: 01 - 25／05\n") {
 		t.Fatalf("lsinfo = %q", ls)
 	}
-	// Clients may still send the original NetEase name, the sanitized name, or either form.
-	for _, name := range []string{`"25／05"`, `"25/05"`, `"23／11／16"`, `"23/11/16"`} {
+	// Clients may still send the original NetEase name, sanitized name, or ordered form.
+	for _, name := range []string{`"25／05"`, `"25/05"`, `"01 - 25／05"`, `"23／11／16"`, `"23/11/16"`, `"07 - 23／11／16"`} {
 		got := response(t, c, r, "listplaylistinfo "+name)
 		if !strings.Contains(got, "file: netease://song/9\n") {
 			t.Fatalf("listplaylistinfo %s = %q", name, got)
@@ -719,6 +753,17 @@ func TestUpdateRefreshEventsAndStats(t *testing.T) {
 	m.tracks[2] = []ncm.Song{{ID: 9, Title: "fresh", Duration: 2 * time.Minute}}
 	m.mu.Unlock()
 	first := response(t, c, r, `update "中文 列表"`)
+	if got := response(t, c, r, `listall "中文 列表"`); !strings.Contains(got, "netease://song/9") {
+		t.Fatalf("scoped refresh not visible: %q", got)
+	}
+	// Scoped update must not pull unrelated playlists into the URI index.
+	if _, ok := s.Catalog.Song(SongURI(8)); ok {
+		t.Fatal("scoped refresh force-loaded unrelated playlist")
+	}
+	m.mu.Lock()
+	callsAfterScoped := m.trackCalls
+	m.mu.Unlock()
+
 	second := response(t, c, r, "rescan")
 	job := func(v string) int {
 		fields := strings.Fields(v)
@@ -734,9 +779,6 @@ func TestUpdateRefreshEventsAndStats(t *testing.T) {
 	if job(second) <= job(first) {
 		t.Fatalf("non-monotonic jobs: %q %q", first, second)
 	}
-	if got := response(t, c, r, `listall "中文 列表"`); !strings.Contains(got, "netease://song/9") {
-		t.Fatalf("refresh not visible: %q", got)
-	}
 	pending := s.State.takePending(sub, nil)
 	for _, want := range []string{"update", "database", "stored_playlist"} {
 		found := false
@@ -747,15 +789,33 @@ func TestUpdateRefreshEventsAndStats(t *testing.T) {
 			t.Errorf("missing idle event %s in %v", want, pending)
 		}
 	}
-	// A scoped refresh must publish complete tracks and URI indexes for every playlist.
-	if len(s.Catalog.Playlists()) != 2 {
-		t.Fatalf("scoped refresh lost playlists: %#v", s.Catalog.Playlists())
+	if got := len(s.Catalog.Playlists()); got != len(composePlaylists(s.Catalog.playlists)) {
+		t.Fatalf("refresh lost playlists: %#v", s.Catalog.Playlists())
 	}
-	if song, ok := s.Catalog.Song(SongURI(8)); !ok || song.ID != 8 {
-		t.Fatalf("scoped refresh did not publish unrelated song: %#v, %v", song, ok)
+	// Full rescan loads playlists that were never cached; unchanged cached lists
+	// (中文 列表, still trackCount=1) are not re-fetched.
+	m.mu.Lock()
+	callsAfterRescan := m.trackCalls
+	m.mu.Unlock()
+	if callsAfterRescan <= callsAfterScoped {
+		t.Fatalf("rescan did not load uncached playlists: before=%d after=%d", callsAfterScoped, callsAfterRescan)
 	}
 	if songs, err := s.Catalog.PlaylistSongs("other"); err != nil || len(songs) != 1 || songs[0].ID != 8 {
-		t.Fatalf("lazy other playlist: %#v, %v", songs, err)
+		t.Fatalf("other playlist after rescan: %#v, %v", songs, err)
+	}
+	if song, ok := s.Catalog.Song(SongURI(8)); !ok || song.ID != 8 {
+		t.Fatalf("other playlist song not indexed: %#v, %v", song, ok)
+	}
+	// Second full rescan with unchanged trackCounts should not refetch.
+	m.mu.Lock()
+	callsBeforeStable := m.trackCalls
+	m.mu.Unlock()
+	_ = response(t, c, r, "rescan")
+	m.mu.Lock()
+	callsAfterStable := m.trackCalls
+	m.mu.Unlock()
+	if callsAfterStable != callsBeforeStable {
+		t.Fatalf("stable rescan refetched tracks: before=%d after=%d", callsBeforeStable, callsAfterStable)
 	}
 	stats1 := response(t, c, r, "stats")
 	time.Sleep(5 * time.Millisecond)
@@ -960,5 +1020,88 @@ func TestEnsureLyricsWritesRmpcPath(t *testing.T) {
 	// second call is cached / no-op
 	if err := s.Catalog.EnsureLyrics(song); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestVirtualPlaylists(t *testing.T) {
+	s, _ := fixture(t)
+	c, r := connect(t, s)
+	defer c.Close()
+
+	listed := response(t, c, r, "listplaylists")
+	// Full server order, zero-padded so rmpc alpha-sort keeps it.
+	wantOrder := []string{
+		"01 - 中文 列表",
+		"02 - 中文 列表（心动模式）",
+		"03 - 私人FM",
+		"04 - 每日推荐",
+		"05 - 最近播放",
+		"06 - 云盘",
+		"07 - other",
+	}
+	pos := 0
+	for _, name := range wantOrder {
+		marker := "playlist: " + name + "\n"
+		i := strings.Index(listed[pos:], marker)
+		if i < 0 {
+			t.Fatalf("listplaylists missing %s after pos %d: %q", name, pos, listed)
+		}
+		pos += i + len(marker)
+	}
+	// Bare names and ordered names both resolve.
+	for _, name := range []string{"私人FM", "03 - 私人FM", "中文 列表（心动模式）", "02 - 中文 列表（心动模式）"} {
+		if _, ok := s.Catalog.Playlist(name); !ok {
+			t.Fatalf("Playlist(%q) not found", name)
+		}
+	}
+
+	cases := []struct {
+		name string
+		uri  string
+	}{
+		{"每日推荐", "netease://song/101"},
+		{"personal_fm", "netease://song/102"},
+		{"最近播放", "netease://song/103"},
+		{"cloud", "netease://song/104"},
+	}
+	for _, tc := range cases {
+		got := response(t, c, r, "listplaylistinfo "+strconv.Quote(tc.name))
+		if !strings.Contains(got, "file: "+tc.uri+"\n") {
+			t.Fatalf("listplaylistinfo %s = %q", tc.name, got)
+		}
+	}
+
+	// 心动模式: seed = first liked track (id 7 in fixture), then recommendations.
+	intel := response(t, c, r, "listplaylistinfo "+strconv.Quote("intelligence"))
+	if !strings.Contains(intel, "file: netease://song/7\n") ||
+		!strings.Contains(intel, "file: netease://song/201\n") ||
+		!strings.Contains(intel, "file: netease://song/202\n") {
+		t.Fatalf("intelligence playlist = %q", intel)
+	}
+	also := response(t, c, r, "listplaylistinfo "+strconv.Quote("中文 列表（心动模式）"))
+	if also != intel {
+		t.Fatalf("full name and alias differ:\n%s\n%s", also, intel)
+	}
+
+	// load virtual playlist into the play queue
+	if got := response(t, c, r, "load "+strconv.Quote("私人FM")); got != "OK\n" {
+		t.Fatalf("load personal fm = %q", got)
+	}
+	if q := s.State.Snapshot().Queue; len(q) == 0 || q[0].Song.ID != 102 {
+		t.Fatalf("queue after load = %#v", q)
+	}
+
+	// virtual playlists are read-only
+	for _, cmd := range []string{
+		"rm " + strconv.Quote("私人FM"),
+		"rename " + strconv.Quote("每日推荐") + " other",
+		"playlistclear " + strconv.Quote("云盘"),
+		"save " + strconv.Quote("私人FM"),
+		"rm " + strconv.Quote("中文 列表（心动模式）"),
+		"save " + strconv.Quote("心动模式"),
+	} {
+		if got := response(t, c, r, cmd); !strings.HasPrefix(got, "ACK ") {
+			t.Fatalf("%s should fail, got %q", cmd, got)
+		}
 	}
 }

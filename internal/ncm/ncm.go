@@ -143,7 +143,7 @@ func fetchPlaylistTracks(id int64, call weapiCaller, known map[int64]Song) ([]So
 	code, body, err := call(playlistDetailAPI, map[string]interface{}{
 		"id": strconv.FormatInt(id, 10),
 		// Ask the detail endpoint for as many embedded track objects as it will
-	// give; when present they replace separate song/detail calls.
+		// give; when present they replace separate song/detail calls.
 		"n": "100000",
 		"s": "0",
 	})

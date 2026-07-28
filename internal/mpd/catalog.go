@@ -68,17 +68,17 @@ func isVirtualPlaylist(id int64) bool {
 
 // virtualPlaylistAliases lets clients address virtual lists by musicfox menu keys.
 var virtualPlaylistAliases = map[string]int64{
-	"每日推荐":          virtualDailyRecommendID,
+	"每日推荐":            virtualDailyRecommendID,
 	"daily_recommend": virtualDailyRecommendID,
 	"daily_songs":     virtualDailyRecommendID,
-	"私人FM":           virtualPersonalFMID,
+	"私人FM":            virtualPersonalFMID,
 	"personal_fm":     virtualPersonalFMID,
-	"最近播放":          virtualRecentSongsID,
+	"最近播放":            virtualRecentSongsID,
 	"recent_songs":    virtualRecentSongsID,
 	"recent":          virtualRecentSongsID,
-	"云盘":            virtualCloudID,
+	"云盘":              virtualCloudID,
 	"cloud":           virtualCloudID,
-	"心动模式":          virtualIntelligenceID,
+	"心动模式":            virtualIntelligenceID,
 	"intelligence":    virtualIntelligenceID,
 }
 
@@ -145,7 +145,7 @@ type Catalog struct {
 	tracks    map[int64][]ncm.Song
 	byURI     map[string]ncm.Song
 	// inflight coalesces concurrent loads of the same playlist id.
-	inflight map[int64]*trackLoad
+	inflight   map[int64]*trackLoad
 	covers     map[string][]byte
 	coverOrder []string
 	refreshed  time.Time
@@ -154,7 +154,7 @@ type Catalog struct {
 }
 
 type trackLoad struct {
-	done chan struct{}
+	done  chan struct{}
 	songs []ncm.Song
 	err   error
 }

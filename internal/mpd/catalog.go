@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -197,8 +198,14 @@ func (c *Catalog) LyricsDir() string {
 }
 
 // LRCPath is the on-disk path rmpc resolves for SongURI(id).
+// On Unix/macOS rmpc maps netease://song/<id> → <dir>/netease:/song/<id>.lrc.
+// Windows forbids ':' in path components, so we use netease_ there instead.
 func LRCPath(dir string, songID int64) string {
-	return filepath.Join(dir, "netease:", "song", strconv.FormatInt(songID, 10)+".lrc")
+	host := "netease:"
+	if runtime.GOOS == "windows" {
+		host = "netease_"
+	}
+	return filepath.Join(dir, host, "song", strconv.FormatInt(songID, 10)+".lrc")
 }
 func SongURI(id int64) string     { return "netease://song/" + strconv.FormatInt(id, 10) }
 func (c *Catalog) User() ncm.User { c.mu.RLock(); defer c.mu.RUnlock(); return c.user }

@@ -1,24 +1,24 @@
 class NetMpd < Formula
   desc "Music Player Daemon adapter for NetEase Cloud Music"
   homepage "https://github.com/4fuu/net-mpd"
-  version "2026.729.0"
+  version "2026.729.1"
   license "GPL-3.0-only"
 
   if OS.mac?
     if Hardware::CPU.arm?
       url "https://github.com/4fuu/net-mpd/releases/download/v#{version}/net-mpd-#{version}-darwin-arm64.tar.gz"
-      sha256 "8eb4cc100593d09f4aae5d6a97bf2ded0803e7d1adeb69bdfb0a68719bba0c74" # darwin-arm64
+      sha256 "a2fc192b98ff3c88b29001d016c76ca04bb85455fe21b9951cc654b76802753c" # darwin-arm64
     else
       url "https://github.com/4fuu/net-mpd/releases/download/v#{version}/net-mpd-#{version}-darwin-amd64.tar.gz"
-      sha256 "2c9d5e35e459a443eb16b03d23e6d96f70cda446de34d52c0612ad893594fe36" # darwin-amd64
+      sha256 "cb9dd4e5d35a19a0daa6f92a77a58e393b668b1bfaa2542bfafd6e0ddf0c465f" # darwin-amd64
     end
   elsif OS.linux?
     if Hardware::CPU.arm?
       url "https://github.com/4fuu/net-mpd/releases/download/v#{version}/net-mpd-#{version}-linux-arm64.tar.gz"
-      sha256 "43290bcf879d43041c62a5b6ece02c59d85d3577e93c76177c7b0a110b702846" # linux-arm64
+      sha256 "956800b360b0cd03090fd57fb2c1cc3acf5ed324b19dd0157b4c750f28494bab" # linux-arm64
     else
       url "https://github.com/4fuu/net-mpd/releases/download/v#{version}/net-mpd-#{version}-linux-amd64.tar.gz"
-      sha256 "b1ed1d5bfa8c02fb4528764bbdc3ff3c85110f5ef402ea8816b894b658fb10e0" # linux-amd64
+      sha256 "4856745759f8ec3605ff5600711b3bad3262a12e7b9bd82527a9fa82b2a4735f" # linux-amd64
     end
   end
 

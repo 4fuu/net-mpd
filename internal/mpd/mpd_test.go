@@ -18,19 +18,21 @@ import (
 )
 
 type fakeMusic struct {
-	mu         sync.Mutex
-	song       ncm.Song
-	cover      []byte
-	resolveErr error
-	playlists  []ncm.Playlist
-	tracks     map[int64][]ncm.Song
-	nextID     int64
-	mutations  []string
-	trackCalls int
-	trackHit   chan struct{}
-	trackGo    chan struct{}
-	resolveHit chan struct{}
-	resolveGo  chan struct{}
+	mu          sync.Mutex
+	song        ncm.Song
+	cover       []byte
+	lyrics      *ncm.Lyrics
+	lyricsCalls int
+	resolveErr  error
+	playlists   []ncm.Playlist
+	tracks      map[int64][]ncm.Song
+	nextID      int64
+	mutations   []string
+	trackCalls  int
+	trackHit    chan struct{}
+	trackGo     chan struct{}
+	resolveHit  chan struct{}
+	resolveGo   chan struct{}
 }
 
 func (f *fakeMusic) Account() (ncm.User, error) { return ncm.User{ID: 1, Nickname: "测试"}, nil }
@@ -108,6 +110,12 @@ func (f *fakeMusic) ResolveURL(int64) (ncm.PlayableInfo, error) {
 }
 func (f *fakeMusic) Cover(ncm.Song) ([]byte, error) { return f.cover, nil }
 func (f *fakeMusic) Lyrics(int64) (ncm.Lyrics, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lyricsCalls++
+	if f.lyrics != nil {
+		return *f.lyrics, nil
+	}
 	return ncm.Lyrics{Original: "[00:00.00]test lyric\n[00:05.00]line two\n"}, nil
 }
 func (f *fakeMusic) CreatePlaylist(name string) (ncm.Playlist, error) {
@@ -1012,14 +1020,18 @@ func TestEnsureLyricsWritesRmpcPath(t *testing.T) {
 		t.Fatalf("expected lrc at %s: %v", path, err)
 	}
 	got := string(b)
-	for _, want := range []string{"[ar:艺人]", "[ti:歌 曲]", "[al:专辑]", "[00:00.00]test lyric"} {
+	for _, want := range []string{"[ar:艺人]", "[ti:歌 曲]", "[al:专辑]", lrcByTag(), "[00:00.00]test lyric"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("lrc missing %q:\n%s", want, got)
 		}
 	}
 	// second call is cached / no-op
+	calls := m.lyricsCalls
 	if err := s.Catalog.EnsureLyrics(song); err != nil {
 		t.Fatal(err)
+	}
+	if m.lyricsCalls != calls {
+		t.Fatalf("cached EnsureLyrics re-fetched lyrics: calls %d -> %d", calls, m.lyricsCalls)
 	}
 }
 

@@ -32,7 +32,7 @@ playlists and rmpc:
 | **Browse** | Artist / album tag views, cloud search |
 | **Playback** | Play / pause / seek / next / previous, volume, repeat / random / single / consume |
 | **Queue** | Add, load playlist, delete, move, swap, shuffle, command lists |
-| **Metadata** | Cover art (`albumart` / `readpicture`), NetEase LRC lyrics for rmpc |
+| **Metadata** | Cover art (`albumart` / `readpicture`), NetEase LRC lyrics for rmpc (bilingual `original / translation` when `tlyric` exists) |
 | **Editing** | Create / rename / delete playlists; add or remove tracks (virtual modes are read-only) |
 | **System** | macOS Now Playing / Control Center / headset keys; local song stickers; optional MPD password |
 | **Engine** | Built-in native audio (no ffplay): AVPlayer (macOS), MediaPlayer (Windows), Beep/Oto (Linux) |
@@ -176,6 +176,20 @@ On each play, net-mpd writes NetEase LRC into the lyrics cache (see startup log
 or `-lyrics`). Point rmpc’s `lyrics_dir` there (example in [Quick start](#quick-start)).
 Restart rmpc or change tracks once after the first play so the Lyrics pane
 picks up the file.
+
+When NetEase provides a translation (`tlyric`), lines are merged for rmpc as
+`original / translation` on the same timestamp. Songs without an official
+translation stay original-only (typical for Chinese tracks).
+
+### Cache limits
+
+| Cache | Policy |
+|-------|--------|
+| Lyrics (disk) | Up to **1000** `.lrc` files or **50 MiB**, whichever bites first; oldest by mtime are pruned. Playing a cached track refreshes its mtime. Format upgrades rewrite stale files automatically. |
+| Cover art (memory) | **32** images, LRU |
+| Library / playlists (memory) | Kept for browsing; refreshed via MPD `update` |
+
+Delete the lyrics directory anytime to force a full re-fetch.
 
 ## Configuration tips (rmpc)
 

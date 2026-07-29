@@ -2,7 +2,6 @@ package mpd
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -146,12 +145,15 @@ type Catalog struct {
 	tracks    map[int64][]ncm.Song
 	byURI     map[string]ncm.Song
 	// inflight coalesces concurrent loads of the same playlist id.
-	inflight   map[int64]*trackLoad
-	covers     map[string][]byte
-	coverOrder []string
-	refreshed  time.Time
-	lyricsDir  string
-	lyricsDone map[int64]bool
+	inflight       map[int64]*trackLoad
+	covers         map[string][]byte
+	coverOrder     []string
+	maxCovers      int
+	refreshed      time.Time
+	lyricsDir      string
+	lyricsDone     map[int64]bool
+	maxLyricsFiles int
+	maxLyricsBytes int64
 }
 
 type trackLoad struct {
@@ -170,15 +172,18 @@ func NewCatalog(service MusicService) (*Catalog, error) {
 		return nil, err
 	}
 	return &Catalog{
-		service:    service,
-		user:       u,
-		playlists:  append([]ncm.Playlist(nil), ps...),
-		tracks:     make(map[int64][]ncm.Song),
-		byURI:      make(map[string]ncm.Song),
-		inflight:   make(map[int64]*trackLoad),
-		covers:     make(map[string][]byte),
-		lyricsDone: map[int64]bool{},
-		refreshed:  time.Now(),
+		service:        service,
+		user:           u,
+		playlists:      append([]ncm.Playlist(nil), ps...),
+		tracks:         make(map[int64][]ncm.Song),
+		byURI:          make(map[string]ncm.Song),
+		inflight:       make(map[int64]*trackLoad),
+		covers:         make(map[string][]byte),
+		maxCovers:      defaultMaxCovers,
+		lyricsDone:     map[int64]bool{},
+		maxLyricsFiles: defaultMaxLyricsFiles,
+		maxLyricsBytes: defaultMaxLyricsBytes,
+		refreshed:      time.Now(),
 	}, nil
 }
 
@@ -186,10 +191,13 @@ func NewCatalog(service MusicService) (*Catalog, error) {
 // Layout matches rmpc's get_lrc_path for URIs like netease://song/<id>:
 //
 //	<dir>/netease:/song/<id>.lrc
+//
+// Triggers a background prune of oversized lyrics caches.
 func (c *Catalog) SetLyricsDir(dir string) {
 	c.mu.Lock()
 	c.lyricsDir = dir
 	c.mu.Unlock()
+	go c.pruneLyricsCache()
 }
 func (c *Catalog) LyricsDir() string {
 	c.mu.RLock()
@@ -842,85 +850,26 @@ func (c *Catalog) ClearPlaylist(name string) error {
 }
 func (c *Catalog) Resolve(s ncm.Song) (ncm.PlayableInfo, error) { return c.service.ResolveURL(s.ID) }
 
-// EnsureLyrics fetches NetEase lyrics and writes an LRC file rmpc can open.
-// Safe to call repeatedly; failures are non-fatal for playback.
-func (c *Catalog) EnsureLyrics(song ncm.Song) error {
-	c.mu.RLock()
-	dir := c.lyricsDir
-	done := c.lyricsDone[song.ID]
-	c.mu.RUnlock()
-	if dir == "" {
-		return nil
-	}
-	path := LRCPath(dir, song.ID)
-	if done {
-		return nil
-	}
-	if st, err := os.Stat(path); err == nil && st.Size() > 0 {
-		c.mu.Lock()
-		c.lyricsDone[song.ID] = true
-		c.mu.Unlock()
-		return nil
-	}
-	ly, err := c.service.Lyrics(song.ID)
-	if err != nil {
-		return err
-	}
-	if ly.Original == "" {
-		c.mu.Lock()
-		c.lyricsDone[song.ID] = true
-		c.mu.Unlock()
-		return nil
-	}
-	body := formatLRC(song, ly)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(body), 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	c.mu.Lock()
-	c.lyricsDone[song.ID] = true
-	c.mu.Unlock()
-	return nil
-}
-
-func formatLRC(song ncm.Song, ly ncm.Lyrics) string {
-	var b strings.Builder
-	if len(song.Artists) > 0 {
-		fmt.Fprintf(&b, "[ar:%s]\n", strings.Join(song.Artists, "/"))
-	}
-	if song.Album != "" {
-		fmt.Fprintf(&b, "[al:%s]\n", song.Album)
-	}
-	if song.Title != "" {
-		fmt.Fprintf(&b, "[ti:%s]\n", song.Title)
-	}
-	fmt.Fprintf(&b, "[by:net-mpd]\n")
-	b.WriteString(strings.TrimRight(ly.Original, "\n"))
-	b.WriteByte('\n')
-	if ly.Translated != "" {
-		// Bilingual: keep original block then translation block so rmpc shows both.
-		b.WriteByte('\n')
-		b.WriteString(strings.TrimRight(ly.Translated, "\n"))
-		b.WriteByte('\n')
-	}
-	return b.String()
-}
-
 func (c *Catalog) Cover(uri string) ([]byte, error) {
-	c.mu.RLock()
-	b, ok := c.covers[uri]
-	s, sok := c.byURI[uri]
-	c.mu.RUnlock()
-	if ok {
-		return append([]byte(nil), b...), nil
+	c.mu.Lock()
+	if b, ok := c.covers[uri]; ok {
+		// Promote to most-recently-used.
+		for i, u := range c.coverOrder {
+			if u == uri {
+				c.coverOrder = append(append(c.coverOrder[:i:i], c.coverOrder[i+1:]...), uri)
+				break
+			}
+		}
+		out := append([]byte(nil), b...)
+		c.mu.Unlock()
+		return out, nil
 	}
+	s, sok := c.byURI[uri]
+	maxCovers := c.maxCovers
+	if maxCovers <= 0 {
+		maxCovers = defaultMaxCovers
+	}
+	c.mu.Unlock()
 	if !sok {
 		return nil, fmt.Errorf("song not found")
 	}
@@ -929,7 +878,19 @@ func (c *Catalog) Cover(uri string) ([]byte, error) {
 		return nil, e
 	}
 	c.mu.Lock()
-	if len(c.covers) >= 32 {
+	// Another goroutine may have filled the cache while we fetched.
+	if existing, ok := c.covers[uri]; ok {
+		for i, u := range c.coverOrder {
+			if u == uri {
+				c.coverOrder = append(append(c.coverOrder[:i:i], c.coverOrder[i+1:]...), uri)
+				break
+			}
+		}
+		out := append([]byte(nil), existing...)
+		c.mu.Unlock()
+		return out, nil
+	}
+	for len(c.covers) >= maxCovers && len(c.coverOrder) > 0 {
 		old := c.coverOrder[0]
 		c.coverOrder = c.coverOrder[1:]
 		delete(c.covers, old)

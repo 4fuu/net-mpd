@@ -122,6 +122,7 @@ Then run `rmpc`.
 | `-cookie` | under app data dir | Cookie jar path |
 | `-lyrics` | beside cookie | LRC cache for rmpc |
 | `-stickers` | beside cookie | Sticker store |
+| `-pause-timeout` | `2m` | Release the audio backend when paused with no clients for this long (`0` disables; resume continues from the same position) |
 | `NET_MPD_HOME` | platform config dir | App data root |
 
 ## Authentication

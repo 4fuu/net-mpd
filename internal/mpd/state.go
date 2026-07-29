@@ -51,6 +51,12 @@ type State struct {
 	outputEnabled                   bool
 	subs                            map[*eventSubscription]struct{}
 	media                           sysmedia.Control
+	// Power save: when no clients are connected and playback stays paused
+	// for pauseTimeout, the audio backend is released (sleeping=true).
+	pauseTimeout time.Duration
+	clients      int
+	sleepTimer   *time.Timer
+	sleeping     bool
 }
 
 func NewState(c *Catalog, p player.Player) *State {
@@ -73,6 +79,7 @@ func (s *State) notify(kind string) {
 		default:
 		}
 	}
+	s.updateSleepTimerLocked()
 	s.mu.Unlock()
 }
 func (s *State) Notify(kinds ...string) {
@@ -103,6 +110,64 @@ func (s *State) takePending(sub *eventSubscription, want map[string]bool) []stri
 	}
 	return kinds
 }
+
+// SetPauseTimeout configures power save: when no MPD client is connected
+// and playback remains paused for d, the audio backend is released and the
+// paused position is remembered. d <= 0 disables the feature.
+func (s *State) SetPauseTimeout(d time.Duration) {
+	s.mu.Lock()
+	s.pauseTimeout = d
+	s.updateSleepTimerLocked()
+	s.mu.Unlock()
+}
+
+// ClientConnected / ClientDisconnected track open MPD connections.
+func (s *State) ClientConnected()    { s.addClient(1) }
+func (s *State) ClientDisconnected() { s.addClient(-1) }
+func (s *State) addClient(d int) {
+	s.mu.Lock()
+	s.clients += d
+	if s.clients < 0 {
+		s.clients = 0
+	}
+	s.updateSleepTimerLocked()
+	s.mu.Unlock()
+}
+
+// updateSleepTimerLocked arms or disarms the power-save timer based on the
+// current state. s.mu must be held.
+func (s *State) updateSleepTimerLocked() {
+	armed := s.pauseTimeout > 0 && s.clients == 0 && s.state == "pause" && !s.sleeping
+	if armed && s.sleepTimer == nil {
+		s.sleepTimer = time.AfterFunc(s.pauseTimeout, s.enterSleep)
+	} else if !armed && s.sleepTimer != nil {
+		s.sleepTimer.Stop()
+		s.sleepTimer = nil
+	}
+}
+
+// enterSleep releases the audio backend after a long unattended pause. The
+// position is remembered so the next play/resume restarts from it.
+func (s *State) enterSleep() {
+	s.transport.Lock()
+	defer s.transport.Unlock()
+	s.mu.Lock()
+	if s.sleeping || s.state != "pause" || s.clients > 0 || s.pauseTimeout <= 0 {
+		s.mu.Unlock()
+		return
+	}
+	if position := s.player.Position(); position > 0 {
+		s.elapsed = position
+	}
+	s.generation++ // invalidate pending backend callbacks before releasing it
+	s.sleeping = true
+	s.sleepTimer = nil
+	at := s.elapsed
+	s.mu.Unlock()
+	_ = s.player.Stop()
+	log.Printf("power save: released audio backend paused at %s, no clients connected", at.Round(time.Second))
+}
+
 func (s *State) Snapshot() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -158,6 +223,7 @@ func (s *State) Clear() {
 	s.current = -1
 	s.state = "stop"
 	s.elapsed = 0
+	s.sleeping = false
 	s.version++
 	s.mu.Unlock()
 	s.transport.Lock()
@@ -183,6 +249,7 @@ func (s *State) DeleteRange(start, end int) error {
 		s.current = -1
 		s.state = "stop"
 		s.elapsed = 0
+		s.sleeping = false
 		s.generation++
 		s.request++
 	}
@@ -346,6 +413,7 @@ func (s *State) playReserved(itemID int64, song ncm.Song, off time.Duration, vol
 	s.elapsed = off
 	s.started = time.Now()
 	s.state = "play"
+	s.sleeping = false
 	s.playbackError = ""
 	s.mu.Unlock()
 	err = s.player.Play(info.URL, info.Type, off, vol, func(err error) { s.playbackEnd(gen, err) })
@@ -448,6 +516,7 @@ func (s *State) Stop() {
 	s.request++
 	s.state = "stop"
 	s.elapsed = 0
+	s.sleeping = false
 	s.mu.Unlock()
 	s.transport.Lock()
 	_ = s.player.Stop()
@@ -462,6 +531,8 @@ func (s *State) Pause(on bool) error {
 	gen := s.generation
 	state := s.state
 	current := s.current
+	sleeping := s.sleeping
+	elapsed := s.elapsed
 	var itemID int64
 	if current >= 0 && current < len(s.queue) {
 		itemID = s.queue[current].ID
@@ -488,6 +559,14 @@ func (s *State) Pause(on bool) error {
 		return nil
 	}
 	if state == "pause" {
+		if sleeping {
+			// Power-save wake: the backend was released, restart the current
+			// song from the remembered position (re-resolves the stream URL).
+			s.transport.Unlock()
+			err := s.playAt(current, elapsed)
+			s.transport.Lock()
+			return err
+		}
 		s.mu.Lock()
 		enabled := s.outputEnabled
 		s.mu.Unlock()
@@ -518,6 +597,7 @@ func (s *State) Seek(off time.Duration) error {
 	gen := s.generation
 	state := s.state
 	current := s.current
+	sleeping := s.sleeping
 	var itemID int64
 	if current >= 0 && current < len(s.queue) {
 		itemID = s.queue[current].ID
@@ -525,6 +605,21 @@ func (s *State) Seek(off time.Duration) error {
 	s.mu.Unlock()
 	if current < 0 {
 		return fmt.Errorf("no current song")
+	}
+	if sleeping && state == "pause" {
+		// Backend is released; just move the remembered resume position.
+		s.mu.Lock()
+		committed := gen == s.generation && s.sleeping && s.state == "pause" && s.current == current && current < len(s.queue) && s.queue[current].ID == itemID
+		if committed {
+			s.elapsed = off
+			s.started = time.Now()
+		}
+		s.mu.Unlock()
+		if committed {
+			s.notify("player")
+			s.publishMedia()
+		}
+		return nil
 	}
 	if err := s.player.Seek(off); err != nil {
 		return err
@@ -629,6 +724,7 @@ func (s *State) SetOutputEnabled(enabled bool) {
 		s.request++
 		s.state = "stop"
 		s.elapsed = 0
+		s.sleeping = false
 	}
 	s.mu.Unlock()
 	if changed && !enabled {

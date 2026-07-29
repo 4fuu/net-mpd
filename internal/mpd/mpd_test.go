@@ -1105,3 +1105,84 @@ func TestVirtualPlaylists(t *testing.T) {
 		}
 	}
 }
+
+func stateFields(st *State) (sleeping bool, timerArmed bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.sleeping, st.sleepTimer != nil
+}
+
+func TestPowerSaveReleasesBackendAndResumesPosition(t *testing.T) {
+	s, m := fixture(t)
+	st := s.State
+	st.SetPauseTimeout(50 * time.Millisecond)
+	st.Add(m.song)
+	if err := st.Play(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Pause(true); err != nil {
+		t.Fatal(err)
+	}
+
+	// A connected client blocks power save.
+	st.ClientConnected()
+	time.Sleep(120 * time.Millisecond)
+	if sleeping, _ := stateFields(st); sleeping {
+		t.Fatal("slept while a client was connected")
+	}
+	st.ClientDisconnected()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if sleeping, _ := stateFields(st); sleeping {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("never entered power save")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if snap := st.Snapshot(); snap.State != "pause" {
+		t.Fatalf("state after sleep = %q, want pause", snap.State)
+	}
+
+	// Seeking while asleep only moves the remembered resume position.
+	if err := st.Seek(30 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Snapshot().Elapsed; got != 30*time.Second {
+		t.Fatalf("elapsed after sleeping seek = %v", got)
+	}
+
+	// Resume wakes the backend and restarts from the remembered position.
+	if err := st.Pause(false); err != nil {
+		t.Fatal(err)
+	}
+	snap := st.Snapshot()
+	if snap.State != "play" || snap.Elapsed != 30*time.Second {
+		t.Fatalf("after wake: state=%q elapsed=%v", snap.State, snap.Elapsed)
+	}
+	if sleeping, _ := stateFields(st); sleeping {
+		t.Fatal("still sleeping after resume")
+	}
+	if _, armed := stateFields(st); armed {
+		t.Fatal("sleep timer still armed after resume")
+	}
+}
+
+func TestPowerSaveDoesNotInterruptPlayback(t *testing.T) {
+	s, m := fixture(t)
+	st := s.State
+	st.SetPauseTimeout(50 * time.Millisecond)
+	st.Add(m.song)
+	if err := st.Play(0); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(120 * time.Millisecond)
+	if sleeping, _ := stateFields(st); sleeping {
+		t.Fatal("slept during playback")
+	}
+	if snap := st.Snapshot(); snap.State != "play" {
+		t.Fatalf("state = %q, want play", snap.State)
+	}
+}

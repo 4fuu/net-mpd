@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/4fuu/net-mpd/internal/mpd"
 	"github.com/4fuu/net-mpd/internal/ncm"
@@ -38,6 +39,7 @@ func runServer() {
 	password := flag.String("password", os.Getenv("NET_MPD_PASSWORD"), "MPD client password (default NET_MPD_PASSWORD)")
 	stickerPath := flag.String("stickers", "", "sticker JSON file (default beside cookie)")
 	lyricsPath := flag.String("lyrics", "", "lyrics cache directory for rmpc (default beside cookie)")
+	pauseTimeout := flag.Duration("pause-timeout", 2*time.Minute, "release the audio backend when paused with no clients for this long (0 disables)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -73,6 +75,7 @@ func runServer() {
 	}
 	defer backend.Close()
 	state := mpd.NewState(catalog, backend)
+	state.SetPauseTimeout(*pauseTimeout)
 	media := sysmedia.New(state)
 	defer media.Release()
 	state.AttachMedia(media)

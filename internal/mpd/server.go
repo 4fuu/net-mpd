@@ -65,6 +65,8 @@ type client struct {
 func (s *Server) handle(conn net.Conn) {
 	events, cancel := s.State.Subscribe()
 	cl := &client{s: s, c: conn, lines: make(chan request, 8), events: events, limit: 8192, authenticated: s.password == ""}
+	s.State.ClientConnected()
+	defer s.State.ClientDisconnected()
 	defer cancel()
 	defer conn.Close()
 	_, _ = io.WriteString(conn, "OK MPD 0.23.5\n")
